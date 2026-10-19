@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI DJ Live</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+  <canvas id="visualizer"></canvas>
+  <div class="bg-blob bg-blob-1"></div>
+  <div class="bg-blob bg-blob-2"></div>
+
+  <div class="container">
+
+    <!-- ═══ LEFT PANEL ═══ -->
+    <div class="glass">
+      <div class="card-header">
+        <div class="brand">
+          <div class="brand-icon"></div>
+          <h1>AI DJ Live</h1>
+        </div>
+      </div>
+
+      <div class="live-center">
+        <section id="ai-state-panel" class="live-dj-status" aria-live="polite">
+          <div class="ai-state-header">
+            <span class="ai-state-label">Live DJ</span>
+            <div id="status-badge" class="status-badge status-off">
+              <div id="status-dot" class="status-dot"></div>
+              <span id="status-text">Offline</span>
+            </div>
+          </div>
+          <div class="ai-state-main">
+            <span id="ai-state-emoji">⚫</span>
+            <div class="ai-state-text">
+              <span id="ai-state-name">AI DJ is off air</span>
+              <span id="ai-state-detail">Say “Hey DJ” or press Talk Live to start.</span>
+            </div>
+          </div>
+          <div id="ai-countdown-wrap" class="ai-countdown-wrap">
+            <div id="ai-countdown-bar"></div>
+          </div>
+          <div id="ai-countdown-text"></div>
+        </section>
+
+        <button id="live-btn" class="live-btn" type="button" aria-pressed="false">
+          <span id="live-btn-icon" aria-hidden="true">🎙️</span>
+          <span id="live-btn-text">Talk Live</span>
+        </button>
+        <div id="live-btn-label" class="live-btn-label">Preparing AI DJ…</div>
+      </div>
+    </div>
+
+    <!-- ═══ RIGHT PANEL ═══ -->
+    <div class="glass">
+      <div class="deck-label">
+        <span>Deck_1.A // Local_Library</span>
+        <div class="slider-container" style="width:auto; margin-bottom:0; gap:5px;">
+          <span style="font-size:12px;">🔈</span>
+          <input type="range" id="volume-slider" min="0" max="1" step="0.01" value="1" />
+          <span style="font-size:12px;">🔊</span>
+        </div>
+      </div>
+      <div class="now-playing">
+        <div id="disc-icon" class="disc">💿</div>
+        <div class="overflow-hidden">
+          <div id="now-playing-state" class="now-playing-label">⏸ Paused</div>
+          <div id="now-playing-title" class="now-playing-title">(Ready)</div>
+          <div id="now-playing-artist" class="now-playing-artist">—</div>
+          <div id="now-playing-playlist" class="now-playing-playlist" style="display:none;"></div>
+        </div>
+      </div>
+      <div class="slider-container">
+        <span id="time-current" class="slider-time">0:00</span>
+        <input type="range" id="seek-slider" min="0" max="100" value="0" />
+        <span id="time-duration" class="slider-time">0:00</span>
+      </div>
+      <div class="transport">
+        <button id="prev-btn" class="transport-btn">⏮</button>
+        <button id="play-pause-btn" class="play-btn"><span id="play-pause-icon">▶</span></button>
+        <button id="next-btn" class="transport-btn">⏭</button>
+      </div>
+
+      <!-- ─── Dynamic AI Playlist Banner / Toast ─── -->
+      <div id="playlist-toast" class="playlist-toast" style="display:none;">
+        <div class="playlist-toast-content">
+          <span class="playlist-toast-icon">✨</span>
+          <div class="playlist-toast-text">
+            <span id="playlist-toast-title" class="playlist-toast-title">AI DJ created a playlist</span>
+            <span id="playlist-toast-detail" class="playlist-toast-detail">Now playing your curated mix</span>
+          </div>
+        </div>
+        <button id="playlist-toast-view-btn" class="playlist-toast-btn">View</button>
+      </div>
+
+      <!-- ─── Up Next / Queue Card ─── -->
+      <div id="queue-container" class="queue-container">
+        <div class="queue-header">
+          <div class="queue-badge-group">
+            <span class="queue-badge">UP NEXT</span>
+            <span id="queue-count" class="queue-count">Empty</span>
+          </div>
+          <div class="queue-header-actions">
+            <button id="queue-view-btn" class="view-toggle-btn" type="button" style="display:none;" aria-expanded="false">👁 View</button>
+            <button id="queue-save-btn" class="queue-save-btn" style="display:none;" title="Save current queue as a playlist">💾 Save</button>
+            <button id="queue-clear-btn" class="queue-clear-btn" style="display:none;" title="Clear Queue">Clear</button>
+          </div>
+        </div>
+        <div id="queue-card" class="queue-card empty">
+          <div id="queue-thumb" class="queue-thumb">🎵</div>
+          <div class="queue-info">
+            <div id="queue-title" class="queue-title">No song cued up</div>
+            <div id="queue-artist" class="queue-artist">Ask AI DJ: “Queue up [song]”</div>
+          </div>
+          <div id="queue-actions" class="queue-actions" style="display:none;">
+            <button id="queue-play-now-btn" class="queue-btn-action" title="Play next song now">▶ Play</button>
+            <button id="queue-remove-btn" class="queue-btn-action" title="Remove from queue">✕</button>
+          </div>
+        </div>
+        <!-- Accordion body: the full queue, toggled by 👁 View -->
+        <div id="queue-expanded" class="queue-expanded" style="display:none;">
+          <div id="queue-tracks-container" class="track-list"></div>
+        </div>
+      </div>
+
+      <!-- ─── Deck Navigation Tabs ─── -->
+      <div class="deck-tabs">
+        <button id="tab-tracks" class="deck-tab active" type="button">
+          <span class="deck-tab-icon">🎵</span>
+          <span>Tracks</span>
+          <span id="badge-tracks-count" class="tab-badge">0</span>
+        </button>
+        <button id="tab-playlists" class="deck-tab" type="button">
+          <span class="deck-tab-icon">📑</span>
+          <span>Playlists</span>
+          <span id="badge-playlists-count" class="tab-badge">0</span>
+        </button>
+      </div>
+
+      <!-- ─── VIEW 1: All Tracks ─── -->
+      <div id="tracks-view" class="deck-view active-view">
+        <div class="track-filter-wrap">
+          <span class="search-icon">🔍</span>
+          <input type="text" id="track-filter" class="track-filter-input" placeholder="Filter tracks by title, artist, genre..." />
+          <button id="track-filter-clear" class="filter-clear-btn" style="display:none;">✕</button>
+        </div>
+        <div id="track-list" class="track-list"></div>
+      </div>
+
+      <!-- ─── VIEW 2: Playlists List ─── -->
+      <div id="playlists-view" class="deck-view" style="display:none;">
+        <div class="playlist-toolbar">
+          <div class="track-filter-wrap" style="flex:1; margin-bottom:0;">
+            <span class="search-icon">🔍</span>
+            <input type="text" id="playlist-filter" class="track-filter-input" placeholder="Filter playlists..." />
+            <button id="playlist-filter-clear" class="filter-clear-btn" style="display:none;">✕</button>
+          </div>
+          <button id="new-playlist-btn" class="btn-create-playlist" type="button">+ New Playlist</button>
+        </div>
+        <div id="playlists-list" class="playlists-list"></div>
+      </div>
+
+
+    </div>
+
+  </div>
+
+  <!-- ─── MODAL: Add to Playlist ─── -->
+  <div id="add-to-playlist-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>Add to Playlist</h3>
+        <button id="modal-close-btn" class="modal-close-btn">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-track-target">
+          <span class="modal-track-icon">🎵</span>
+          <div class="modal-track-target-info">
+            <div id="modal-target-title" class="modal-target-title">Song Title</div>
+            <div id="modal-target-artist" class="modal-target-artist">Artist</div>
+          </div>
+        </div>
+        <div class="modal-section-title">Select Playlist</div>
+        <div id="modal-playlists-list" class="modal-playlists-list"></div>
+        <div class="modal-divider">or create new</div>
+        <div class="modal-create-row">
+          <input type="text" id="modal-new-pl-name" class="modal-input" placeholder="New playlist name..." />
+          <button id="modal-create-pl-btn" class="modal-btn-confirm">Create & Add</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── MODAL: Save Queue as Playlist ─── -->
+  <div id="save-queue-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>Save Queue as Playlist</h3>
+        <button id="save-queue-close-btn" class="modal-close-btn">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-desc">Save the currently queued songs into a permanent playlist.</p>
+        <div class="modal-form-group">
+          <label>Playlist Name</label>
+          <input type="text" id="save-queue-name-input" class="modal-input" placeholder="e.g. My Favorite Mix" />
+        </div>
+        <div class="modal-actions-row">
+          <button id="save-queue-cancel-btn" class="modal-btn-cancel">Cancel</button>
+          <button id="save-queue-confirm-btn" class="modal-btn-confirm">Save Playlist</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <audio id="music-player" preload="none" crossorigin="anonymous"></audio>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

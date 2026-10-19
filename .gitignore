@@ -1,0 +1,123 @@
+# ==========================================
+# Python
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+.venv/
+backend/.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+nosetests.xml
+coverage.xml
+
+# ==========================================
+# Environment Variables & Secrets
+# ==========================================
+.env
+.env.*
+backend/.env
+backend/.env.*
+!.env.example
+!backend/.env.example
+
+# ==========================================
+# DJ Nova Application Data & Local State
+# ==========================================
+# User-generated playlists and atomic write temp files
+backend/playlists.json
+*.tmp
+*.bak
+
+# Audio & Music Files (keep large local libraries out of git)
+*.mp3
+*.wav
+*.flac
+*.m4a
+*.aac
+*.ogg
+*.wma
+*.alac
+*.aiff
+
+# ==========================================
+# Logs & Databases
+# ==========================================
+*.log
+*.sqlite3
+*.db
+
+# ==========================================
+# Node / Frontend (if package managers used)
+# ==========================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ==========================================
+# Operating System Files
+# ==========================================
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Linux
+*~
+.directory
+
+# ==========================================
+# IDEs & Code Editors
+# ==========================================
+.vscode/
+!.vscode/settings.json.example
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
