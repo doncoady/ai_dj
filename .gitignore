@@ -56,8 +56,15 @@ backend/.env.*
 # ==========================================
 # DJ Nova Application Data & Local State
 # ==========================================
-# User-generated playlists and atomic write temp files
+# User-generated playlists, radio stations, podcast subscriptions, audiobook
+# progress and atomic write temp files
 backend/playlists.json
+backend/radio_stations.json
+backend/podcasts.json
+backend/audiobooks.json
+# Scan caches (tags keyed by path + size + mtime; rebuilt automatically)
+backend/library_cache.json
+backend/audiobooks_cache.json
 *.tmp
 *.bak
 
@@ -71,6 +78,8 @@ backend/playlists.json
 *.wma
 *.alac
 *.aiff
+*.m4b
+*.opus
 
 # ==========================================
 # Logs & Databases

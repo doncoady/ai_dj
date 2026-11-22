@@ -1,5 +1,43 @@
 """
-AI DJ Backend — FastAPI + Gemini Live API proxy (V6.2)
+AI DJ Backend — FastAPI + Gemini Live API proxy (V6.5)
+
+Changes from V6.4:
+  - Start-up: the server serves immediately and scans music/audiobooks in a
+    background task with progress (/api/status, 503 body of /api/tracks);
+    tag reads are cached on disk (scancache.py) so restarts are near-instant.
+    POST /api/tracks/rescan.
+  - Streaming tab (streaming.py): online sources as sub-sections — Apple
+    Music and Deezer previews (keyless) and YouTube Music full songs through
+    the third-party tools ytmusicapi + yt-dlp; all audio relayed through the
+    deck. Source type "stream", tools playStream / queueStream.
+
+Changes from V6.3:
+  - Local audiobooks (audiobooks.py): AUDIOBOOKS_DIR from .env is scanned
+    into books with ordered chapters (folder or tag based, disc sub-folders
+    merged), REST API under /api/audiobooks with Range streaming, cover art
+    and server-side listening progress, voice tools playAudiobook /
+    listAudiobooks / describeAudiobook ("continue my book", "chapter 5").
+  - playback_state.source understands "audiobook" and "stream"; new browser
+    commands playAudiobookChapter, playStreamTracks, queueStreamTracks.
+    seekRelative / setPlaybackSpeed work for every seekable source.
+    Protocol version 5.
+
+Changes from V6.2:
+  - Live radio sources (radio.py): saved internet-radio stations (seeded with
+    a few SomaFM channels), optional radio-browser.info directory search,
+    REST API under /api/radio, and a same-origin stream proxy
+    (/api/radio/{id}/stream) that follows .pls/.m3u playlists and demuxes ICY
+    "StreamTitle" metadata so the DJ knows which song is on air.
+  - Podcast sources (podcasts.py): RSS subscriptions with cached episodes,
+    optional Apple podcast directory search, REST API under /api/podcasts, and
+    a Range-forwarding episode proxy so seeking/resume work in the browser.
+  - Voice tools: playRadio, listRadioStations, saveRadioStation,
+    removeRadioStation, playPodcast, listPodcasts, describePodcast,
+    subscribeToPodcast, unsubscribeFromPodcast, seekRelative.
+    describeNowPlaying / playback_summary() understand radio & podcast sources.
+  - playback_state gained `source` (radio/podcast the browser is playing);
+    new browser commands playRadio, playPodcastEpisode, seekRelative,
+    radioStationsChanged, podcastsChanged. Protocol version 4.
 
 Changes from V6.1:
   - Voice playlist management tools: createPlaylist, addToPlaylist,
@@ -63,24 +101,44 @@ import httpx
 
 try:
     from backend import playlists as pl_manager
+    from backend import radio as radio_manager
+    from backend import podcasts as podcast_manager
+    from backend import audiobooks as audiobook_manager
+    from backend import streaming as streaming_manager
+    from backend import scancache
 except ImportError:
     import playlists as pl_manager
+    import radio as radio_manager
+    import podcasts as podcast_manager
+    import audiobooks as audiobook_manager
+    import streaming as streaming_manager
+    import scancache
 
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 5
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MUSIC_DIR = Path(os.getenv("MUSIC_DIR", Path.home() / "Music"))
+# Local audiobooks (optional). Unset/missing directory = the Audiobooks tab
+# explains how to configure it; nothing else changes.
+_ab_dir = (os.getenv("AUDIOBOOKS_DIR") or "").strip()
+AUDIOBOOKS_DIR: Path | None = Path(_ab_dir) if _ab_dir else None
 USE_SEARCH_TOOL = os.getenv("USE_SEARCH_TOOL", "true").lower() == "true"
 GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
 # Console verbosity. HTTP_ACCESS_LOG=true re-enables uvicorn's per-request
 # lines (art/stream/static requests are still filtered out as noise).
 HTTP_ACCESS_LOG = os.getenv("HTTP_ACCESS_LOG", "false").lower() == "true"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "info").lower()
+# Online directories for discovering radio stations (radio-browser.info) and
+# podcasts (Apple podcast search). Both are keyless; set false to stay offline.
+ONLINE_DIRECTORIES = os.getenv("ONLINE_DIRECTORIES", "true").lower() == "true"
+# Second station directory (TuneIn's unofficial OPML endpoints) — much better
+# coverage of local commercial stations. Set false to use radio-browser only.
+TUNEIN_DIRECTORY = os.getenv("TUNEIN_DIRECTORY", "true").lower() == "true"
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".wma", ".aac"}
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 STREAM_CHUNK_SIZE = 64 * 1024
@@ -92,7 +150,27 @@ if not GEMINI_API_KEY:
 music_library: list[dict] = []
 tracks_by_id: dict[str, dict] = {}
 scan_complete: bool = False
+# Live progress of the background library scan, for /api/status and the
+# browser's loading message: phase = listing | reading | done, found = files
+# seen, read = files whose tags are known so far.
+scan_progress: dict = {"phase": "idle", "found": 0, "read": 0, "startedAt": None, "finishedAt": None, "cached": 0}
 album_art_cache: OrderedDict = OrderedDict()
+# station_id -> {"title": "Artist - Song", "updatedAt": epoch}; filled by the
+# radio stream proxy from ICY metadata while a station is being relayed.
+radio_now_playing: dict[str, dict] = {}
+# Non-library playback sources the browser may report in playback_state.source.
+# Adding a new kind = add it here + a summary formatter in
+# ClientConn.source_summary + a browser tab (see README "Adding a Source").
+SOURCE_TYPES = {"radio", "podcast", "audiobook", "stream"}
+# Sources that can be skipped within / sped up (everything but live radio).
+SEEKABLE_SOURCE_TYPES = {"podcast", "audiobook", "stream"}
+SOURCE_NOUNS = {"radio": "a live radio station", "podcast": "a podcast episode",
+                "audiobook": "an audiobook chapter", "stream": "a streamed track"}
+
+# Audiobooks scanned from AUDIOBOOKS_DIR (books with ordered chapters).
+audiobook_library: list[dict] = []
+audiobooks_by_id: dict[str, dict] = {}
+audiobooks_scan_complete: bool = False
 
 
 def _stable_track_id(rel_path: str) -> str:
@@ -117,21 +195,39 @@ def _get_metadata(filepath: Path):
     return filepath.stem, "Unknown Artist", "", filepath.suffix[1:].upper()
 
 
-def scan_music_library() -> list[dict]:
-    tracks = []
+def _read_track_meta(filepath: Path) -> dict:
+    title, artist, album, genre = _get_metadata(filepath)
+    return {"title": title, "artist": artist, "album": album, "genre": genre}
+
+
+def scan_music_library(progress: dict | None = None, use_cache: bool = True) -> list[dict]:
+    """Walk MUSIC_DIR into track records. Tags come from the on-disk cache
+    when a file's size/mtime are unchanged, so only new files hit mutagen.
+    `progress` (scan_progress) is updated as it goes for the loading UI."""
+    progress = progress if progress is not None else {}
+    progress.update({"phase": "listing", "found": 0, "read": 0, "cached": 0, "startedAt": time.time(), "finishedAt": None})
+    tracks: list[dict] = []
     if not MUSIC_DIR.exists():
         print(f"[Warn] Music directory not found: {MUSIC_DIR}")
+        progress.update({"phase": "done", "finishedAt": time.time()})
         return tracks
-    for f in sorted(MUSIC_DIR.rglob("*")):
-        if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS:
-            rel = f.relative_to(MUSIC_DIR)
-            title, artist, album, genre = _get_metadata(f)
-            tracks.append({
-                "id": _stable_track_id(str(rel)),
-                "title": title, "artist": artist,
-                "album": album, "genre": genre,
-                "filename": str(rel),
-            })
+    files = [f for f in sorted(MUSIC_DIR.rglob("*")) if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS]
+    progress.update({"phase": "reading", "found": len(files)})
+    cache = scancache.TagCache("library") if use_cache else None
+    for f in files:
+        rel = str(f.relative_to(MUSIC_DIR))
+        meta = cache.get(f, rel.replace("\\", "/"), _read_track_meta) if cache else _read_track_meta(f)
+        tracks.append({
+            "id": _stable_track_id(rel),
+            "title": meta.get("title") or f.stem, "artist": meta.get("artist") or "Unknown Artist",
+            "album": meta.get("album") or "", "genre": meta.get("genre") or f.suffix[1:].upper(),
+            "filename": rel,
+        })
+        progress["read"] = len(tracks)
+    if cache:
+        cache.save()
+        progress["cached"] = cache.hits
+    progress.update({"phase": "done", "finishedAt": time.time()})
     return tracks
 
 
@@ -237,16 +333,78 @@ async def lifespan(app: FastAPI):
 
         loop.set_exception_handler(custom_exception_handler)
 
+    # The server starts serving immediately; the library scans run in the
+    # background and the browser shows their progress (a cold scan of a large
+    # library used to block every request for its whole duration).
+    print("⏳ Scanning music library in the background…")
+    scan_task = asyncio.create_task(_startup_scans())
+    print(f"📻 {len(radio_manager.load_stations())} radio stations, 🎙 {len(podcast_manager.load_podcasts())} podcast subscriptions"
+          f" (online directories {'on' if ONLINE_DIRECTORIES else 'off'})")
+    avail = ", ".join(streaming_manager.provider_name(p) for p in streaming_manager.available_providers())
+    print(f"🌐 Streaming sources: {avail}" + ("" if streaming_manager.provider_status("ytmusic")["available"] else "  (YouTube Music: pip install ytmusicapi yt-dlp)"))
+    print(f"🔍 USE_SEARCH_TOOL is set to {USE_SEARCH_TOOL}")
+    refresh_task = asyncio.create_task(_fetch_unfetched_podcasts())
+    yield
+    scan_task.cancel()
+    refresh_task.cancel()
+    print("Shutting down AI DJ backend.")
+
+
+async def rescan_music_library() -> int:
+    """(Re)scan MUSIC_DIR off the event loop; returns the track count."""
     global music_library, tracks_by_id, scan_complete
-    print("⏳ Scanning music library in background (Recursive)...")
     loop = asyncio.get_running_loop()
-    music_library = await loop.run_in_executor(None, scan_music_library)
+    t0 = time.perf_counter()
+    music_library = await loop.run_in_executor(None, scan_music_library, scan_progress)
     tracks_by_id = {t["id"]: t for t in music_library}
     scan_complete = True
-    print(f"🎵 Loaded {len(music_library)} tracks from {MUSIC_DIR}")
-    print(f"🔍 USE_SEARCH_TOOL is set to {USE_SEARCH_TOOL}")
-    yield
-    print("Shutting down AI DJ backend.")
+    print(f"🎵 Loaded {len(music_library)} tracks from {MUSIC_DIR} in {time.perf_counter() - t0:.1f}s "
+          f"({scan_progress.get('cached', 0)} from cache)")
+    return len(music_library)
+
+
+async def _startup_scans():
+    try:
+        await rescan_music_library()
+        await rescan_audiobooks()
+        if AUDIOBOOKS_DIR:
+            print(f"📖 Loaded {len(audiobook_library)} audiobooks from {AUDIOBOOKS_DIR}")
+        else:
+            print("📖 Audiobooks: AUDIOBOOKS_DIR not set (optional)")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"[Scan] Library scan failed: {e}")
+        scan_progress.update({"phase": "done", "finishedAt": time.time(), "error": str(e)})
+        globals()["scan_complete"] = True
+        globals()["audiobooks_scan_complete"] = True
+
+
+async def rescan_audiobooks() -> int:
+    """(Re)scan AUDIOBOOKS_DIR off the event loop; returns the book count."""
+    global audiobook_library, audiobooks_by_id, audiobooks_scan_complete
+    loop = asyncio.get_running_loop()
+    books = await loop.run_in_executor(None, audiobook_manager.scan_audiobooks, AUDIOBOOKS_DIR)
+    audiobook_library = books
+    audiobooks_by_id = {b["id"]: b for b in books}
+    audiobooks_scan_complete = True
+    return len(books)
+
+
+async def _fetch_unfetched_podcasts():
+    """Starter-pick podcasts are seeded without episodes; load them in the
+    background so the Podcasts tab fills in shortly after start-up. Feeds that
+    fail (offline) are simply retried the next time they are opened/played."""
+    try:
+        async with _http_client(timeout=15.0) as client:
+            results = await podcast_manager.refresh_unfetched(client=client)
+    except Exception as e:
+        print(f"[Podcasts] Background feed fetch failed: {e}")
+        return
+    if results:
+        ok = sum(1 for err in results.values() if err is None)
+        failed = [err for err in results.values() if err]
+        print(f"🎙 Loaded episodes for {ok}/{len(results)} starter podcasts" + (f" ({len(failed)} failed: {failed[0]})" if failed else ""))
 
 
 # ─── Track Search Matching ────────────────────────────────────────────────────
@@ -339,6 +497,94 @@ PLAYLIST_MANAGEMENT_INSTRUCTIONS = (
     "(title, artist, album/genre). Do not describe the playlist unless asked; a playlist being active does not mean the "
     "current song is from it — the tool tells you whether it is.\n"
 )
+
+
+RADIO_PODCAST_INSTRUCTIONS = (
+    "\nLIVE RADIO (voice controls):\n"
+    "- 'play/put on/tune in to <station>', 'play some jazz radio', 'put the radio on' -> `playRadio`. Saved stations are tried "
+    "first (names are fuzzy-matched, genres count too); if none fits, the online station directories are searched. "
+    "Pass a city/region as `place` when mentioned ('a Halifax station', 'radio from Montreal') and a country as `country`. "
+    "A radio request is NOT a playlist request: do not use createAndPlayPlaylist for 'radio' or 'station'.\n"
+    "- 'what stations do I have' -> `listRadioStations`. 'save/keep this station', 'add a <genre> station' -> `saveRadioStation`. "
+    "'remove/forget the X station' -> `removeRadioStation`.\n"
+    "- Live radio cannot be paused-and-resumed in place, skipped, or seeked; 'stop the radio' -> `pausePlayback`. "
+    "'what song is this' while radio plays -> `describeNowPlaying` (it reports the station's on-air title when known).\n"
+    "\nPODCASTS (voice controls):\n"
+    "- 'play <podcast>', 'play the latest <podcast>', 'play episode 12 of X', 'play the next/previous episode', "
+    "'continue my podcast' -> `playPodcast` (episode defaults to the latest; playback resumes where the user left off).\n"
+    "- 'what podcasts do I have' -> `listPodcasts`. 'what episodes are there', 'what's the latest X about' -> `describePodcast`.\n"
+    "- 'subscribe to X', 'add the X podcast', 'follow X' -> `subscribeToPodcast` (searches the podcast directory, does not start playback). "
+    "'unsubscribe from X', 'remove the X podcast' -> `unsubscribeFromPodcast`.\n"
+    "- 'what's new in my podcasts', 'any new episodes' -> `listLatestEpisodes`; 'play the newest episodes', 'catch me up', 'cue up what's new' -> `playLatestEpisodes` "
+    "(the newest episode of each show, newest first; queueOnly=true to cue without interrupting).\n"
+    "- 'skip ahead 30 seconds', 'go back a minute', 'rewind 15 seconds' -> `seekRelative` (negative seconds = back).\n"
+    "- 'play faster', 'speed it up', 'one and a half speed', 'normal speed' -> `setPlaybackSpeed` (rate 0.5–3; 1 = normal). Podcasts and audiobooks only — music and live radio always play at 1x.\n"
+    "\nVOLUME:\n"
+    "- 'turn it up/down', 'louder', 'quieter', 'volume 40 percent', 'half volume', 'mute', 'max volume' -> `setVolume` "
+    "(level 0–100, or change e.g. +15/-15). This is the app's music volume slider, separate from your own voice.\n"
+    "- Podcast and radio names may be spoken loosely; pass them as heard, the tools fuzzy-match. If a tool reports no match, "
+    "tell the user what IS available and ask which they meant.\n"
+    "- Switching back to music: any track/playlist tool (searchAndPlay, playPlaylist, nextTrack…) leaves the radio/podcast/audiobook/streaming source and plays the library.\n"
+    "- STARTER PICKS: on first run the Radio and Podcasts tabs are pre-loaded with popular stations and shows. If asked, explain they are "
+    "starter picks the user can remove, and that more can be added by voice ('save a jazz station', 'subscribe to <show>') or with the "
+    "Find Stations / Subscribe buttons in the GUI.\n"
+)
+
+
+AUDIOBOOK_STREAMING_INSTRUCTIONS = (
+    "\nAUDIOBOOKS (voice controls; local files from the user's audiobook folder):\n"
+    "- 'play/continue/resume <book>', 'continue my audiobook', 'keep reading', 'play chapter 5 of X', 'next chapter', "
+    "'start X from the beginning' -> `playAudiobook` (book defaults to the one last listened to; chapter defaults to where the user left off).\n"
+    "- 'what audiobooks do I have', 'which books are in progress' -> `listAudiobooks`. 'how far am I in X', 'what chapters does X have', "
+    "'who narrates X' -> `describeAudiobook`.\n"
+    "- While a chapter plays, `seekRelative` ('go back 30 seconds') and `setPlaybackSpeed` ('1.5x') work like for podcasts; "
+    "`nextTrack` / `previousTrack` move between chapters. Book progress is remembered automatically.\n"
+    "- An audiobook request is NOT a music request: never use searchAndPlay or createAndPlayPlaylist for 'book', 'audiobook', 'chapter' or 'novel'.\n"
+    "\nSTREAMING (voice controls; the Streaming tab searches online sources: Apple Music previews, Deezer previews, YouTube Music full songs):\n"
+    "- 'stream <song/artist/album>', 'play <song> online / from YouTube Music / from Deezer', or a song that is NOT in the local library when the user "
+    "asks for it anyway -> `playStream` (kind = track/album/artist when the user says which; source = the provider when they name one). "
+    "'queue/cue <song> from streaming' -> `queueStream`.\n"
+    "- HOW IT PLAYS: Apple Music and Deezer give 30-second preview clips; YouTube Music plays the full song (when its tools are installed). "
+    "Everything plays through the deck. The tool result says which source and whether it is a clip; mention it briefly only the first time or when asked.\n"
+    "- Prefer the local library for plain 'play <song>' requests; use streaming when the user says 'stream', names a source, or the library has no match and they want the song anyway.\n"
+)
+
+
+def _sources_summary() -> str:
+    """Saved station / podcast / audiobook names (and streaming sources) for the
+    system prompt, so the DJ can recognise them in speech without a round-trip."""
+    parts = []
+    stations = radio_manager.load_stations()
+    if stations:
+        names = ", ".join(f"'{s['name']}'" for s in stations[:15])
+        more = f" (+{len(stations) - 15} more)" if len(stations) > 15 else ""
+        parts.append(f"Saved radio stations: {names}{more}.")
+    else:
+        parts.append("No radio stations are saved yet" + (" (the online directory can find some)." if ONLINE_DIRECTORIES else "."))
+    pods = podcast_manager.load_podcasts()
+    if pods:
+        names = ", ".join(f"'{p['title']}'" for p in pods[:15])
+        more = f" (+{len(pods) - 15} more)" if len(pods) > 15 else ""
+        parts.append(f"Podcast subscriptions: {names}{more}.")
+    else:
+        parts.append("No podcast subscriptions yet" + (" (subscribeToPodcast can find shows by name)." if ONLINE_DIRECTORIES else "."))
+    if AUDIOBOOKS_DIR is None:
+        parts.append("Audiobooks are not configured (no AUDIOBOOKS_DIR in .env); say so if asked for one.")
+    elif audiobook_library:
+        progress = audiobook_manager.load_progress()
+        names = []
+        for b in audiobook_library[:15]:
+            prog = progress.get(b["id"])
+            tag = " [in progress]" if prog and not prog.get("finished") else (" [finished]" if prog else "")
+            names.append(f"'{b['title']}'" + (f" by {b['author']}" if b.get("author") and b["author"] != "Unknown Author" else "") + tag)
+        more = f" (+{len(audiobook_library) - 15} more)" if len(audiobook_library) > 15 else ""
+        parts.append(f"Audiobooks: {'; '.join(names)}{more}.")
+    else:
+        parts.append("The audiobook folder is configured but no audiobooks were found in it.")
+    avail = [streaming_manager.provider_name(p) for p in streaming_manager.available_providers()]
+    missing = [streaming_manager.provider_name(p) for p in streaming_manager.PROVIDER_ORDER if p not in streaming_manager.available_providers()]
+    parts.append(f"Streaming sources available: {', '.join(avail) or 'none'}" + (f" (not installed: {', '.join(missing)})" if missing else "") + ".")
+    return " ".join(parts)
 
 
 def build_gemini_config():
@@ -607,8 +853,189 @@ def build_gemini_config():
         },
         {
             "name": "describeNowPlaying",
-            "description": "Tells you exactly which SONG is playing right now (title, artist, album, genre) and whether it belongs to the active playlist. ALWAYS call this for 'what's playing', 'what song is this', 'who sings this', 'what is this' — answer about the song, not the playlist.",
+            "description": "Tells you exactly what is playing right now: the SONG (title, artist, album, genre) and whether it belongs to the active playlist, or the live radio station (with its on-air song title when known), or the podcast episode and position. ALWAYS call this for 'what's playing', 'what song is this', 'who sings this', 'what is this' — answer about the song, not the playlist.",
             "parameters": {"type": "OBJECT", "properties": {}},
+        },
+        # ── Live radio ────────────────────────────────────────────────────
+        {
+            "name": "playRadio",
+            "description": "Tunes in to a live internet radio station and starts playing it. Use for 'play <station>', 'put on some jazz radio', 'tune in to the BBC', 'play the radio'. Saved stations are matched first by name or genre; otherwise the online station directory is searched.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "query": {"type": "STRING", "description": "Station name, genre or keywords as spoken (e.g. 'groove salad', 'jazz', 'move 100', 'classic rock station'). Empty = the last played / first saved station."},
+                    "country": {"type": "STRING", "description": "Optional country to narrow an online directory search (e.g. 'Canada')."},
+                    "place": {"type": "STRING", "description": "Optional city or region mentioned by the user (e.g. 'Halifax', 'Nova Scotia')."},
+                },
+            },
+        },
+        {
+            "name": "listRadioStations",
+            "description": "Lists the user's saved radio stations (name and genre).",
+            "parameters": {"type": "OBJECT", "properties": {}},
+        },
+        {
+            "name": "saveRadioStation",
+            "description": "Saves a radio station to the user's station list without changing playback. Empty query = save the station that is playing right now (e.g. one found in the directory). A query such as 'a jazz station' or 'BBC Radio 6' searches the directory and saves the best match.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "query": {"type": "STRING", "description": "Station to find and save, or empty/'this' for the station playing now."},
+                    "name": {"type": "STRING", "description": "Optional custom name to save it under."},
+                },
+            },
+        },
+        {
+            "name": "removeRadioStation",
+            "description": "Removes a saved radio station. Use for 'remove/forget/delete the X station'. Use 'current' for the station playing now.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {"name": {"type": "STRING", "description": "Saved station name as spoken, or 'current'."}},
+                "required": ["name"],
+            },
+        },
+        # ── Podcasts ──────────────────────────────────────────────────────
+        {
+            "name": "playPodcast",
+            "description": "Plays an episode of a subscribed podcast. Use for 'play <podcast>', 'play the latest <podcast>', 'play episode 12 of X', 'play the next/previous episode', 'continue my podcast'. Episode defaults to the latest. Use podcast='current' for the podcast playing now.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "podcast": {"type": "STRING", "description": "Podcast title as spoken, or 'current' for the one playing now."},
+                    "episode": {"type": "STRING", "description": "Which episode: empty/'latest', 'oldest', 'second latest', 'episode 45', 'next', 'previous', or title keywords."},
+                },
+                "required": ["podcast"],
+            },
+        },
+        {
+            "name": "listPodcasts",
+            "description": "Lists the podcasts the user is subscribed to, with their latest episode.",
+            "parameters": {"type": "OBJECT", "properties": {}},
+        },
+        {
+            "name": "describePodcast",
+            "description": "Tells you a podcast's recent episodes (titles, dates, lengths) so you can read them back. Use for 'what episodes of X are there', 'what's the latest X about'.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {"podcast": {"type": "STRING", "description": "Podcast title as spoken, or 'current'."}},
+                "required": ["podcast"],
+            },
+        },
+        {
+            "name": "subscribeToPodcast",
+            "description": "Finds a podcast by name in the online podcast directory (or takes a feed URL) and subscribes to it WITHOUT playing. Use for 'subscribe to X', 'add the X podcast', 'follow X'.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {"query": {"type": "STRING", "description": "Podcast name as spoken, or an RSS feed URL."}},
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "unsubscribeFromPodcast",
+            "description": "Removes a podcast subscription. Use for 'unsubscribe from X', 'remove the X podcast'.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {"podcast": {"type": "STRING", "description": "Podcast title as spoken, or 'current'."}},
+                "required": ["podcast"],
+            },
+        },
+        # ── Audiobooks ────────────────────────────────────────────────────
+        {
+            "name": "playAudiobook",
+            "description": "Plays (or continues) a local audiobook. Use for 'continue my book', 'play the Hobbit', 'play chapter 5 of Dune', 'next chapter', 'start it from the beginning'. Book defaults to the one most recently listened to; chapter defaults to where the user left off.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "book": {"type": "STRING", "description": "Book title or author as spoken, or empty/'current' for the book playing now or listened to most recently."},
+                    "chapter": {"type": "STRING", "description": "Empty/'continue' = resume; 'chapter 5'; 'next'; 'previous'; 'from the beginning'; 'last chapter'; or chapter title keywords."},
+                },
+            },
+        },
+        {
+            "name": "listAudiobooks",
+            "description": "Lists the user's local audiobooks with author, length and listening progress.",
+            "parameters": {"type": "OBJECT", "properties": {}},
+        },
+        {
+            "name": "describeAudiobook",
+            "description": "Details of one audiobook: author, narrator, length, chapters and how far the user has listened. Use for 'how far am I in X', 'what chapters does X have', 'who reads X'.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {"book": {"type": "STRING", "description": "Book title/author as spoken, or 'current'."}},
+            },
+        },
+        # ── Streaming sources ─────────────────────────────────────────────
+        {
+            "name": "playStream",
+            "description": "Plays music from the online streaming sources (Streaming tab): a song (default), a whole album, or an artist's songs. Use when the user says 'stream', names a source (Apple Music, Deezer, YouTube Music) or wants a song the local library lacks. Apple Music/Deezer give 30-second previews; YouTube Music plays full songs.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "query": {"type": "STRING", "description": "Song, artist or album as spoken (e.g. 'Blinding Lights', 'Daft Punk', 'the album Discovery')."},
+                    "kind": {"type": "STRING", "description": "What to look for: 'track' (default), 'album' or 'artist'."},
+                    "source": {"type": "STRING", "description": "Optional provider the user named: 'apple', 'deezer' or 'youtube'. Empty = the first source with a match."},
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "queueStream",
+            "description": "Finds a song on the online streaming sources and adds it to the END of the queue without interrupting playback. Use for 'queue up X from YouTube Music', 'stream X next'.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "query": {"type": "STRING", "description": "Song (and artist) as spoken."},
+                    "source": {"type": "STRING", "description": "Optional provider: 'apple', 'deezer' or 'youtube'."},
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "listLatestEpisodes",
+            "description": "Lists the newest episode of each subscribed podcast, newest first. Use for 'what's new in my podcasts', 'any new episodes', 'what came out today'.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {"count": {"type": "NUMBER", "description": "How many to list (default 8)."}},
+            },
+        },
+        {
+            "name": "playLatestEpisodes",
+            "description": "Plays the newest podcast episodes across all subscriptions: the most recent one now, the next ones cued (or all cued when queueOnly=true). Use for 'play the newest episodes', 'catch me up on my podcasts', 'cue up what's new'.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "count": {"type": "NUMBER", "description": "How many episodes (default 5)."},
+                    "queueOnly": {"type": "BOOLEAN", "description": "True to cue them all without interrupting playback."},
+                },
+            },
+        },
+        {
+            "name": "setVolume",
+            "description": "Sets or nudges the app's music volume slider (0–100). Use for 'turn it up', 'quieter', 'volume 40 percent', 'mute' (0), 'max volume' (100). Give `level` for an absolute value or `change` for a relative step (default +15 / -15).",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "level": {"type": "NUMBER", "description": "Absolute volume 0–100."},
+                    "change": {"type": "NUMBER", "description": "Relative change in percent, e.g. 15 (louder) or -15 (quieter)."},
+                },
+            },
+        },
+        {
+            "name": "setPlaybackSpeed",
+            "description": "Sets the playback speed for podcasts and audiobooks. Use for 'play at 1.5x', 'speed it up' (one step faster), 'slow down', 'normal speed' (1). Has no effect on music or live radio.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {"rate": {"type": "NUMBER", "description": "Playback rate, 0.5 to 3. Omit to step one notch faster than now."}},
+            },
+        },
+        {
+            "name": "seekRelative",
+            "description": "Skips forward or back inside the current podcast episode, audiobook chapter, streamed track or song. Use for 'skip ahead 30 seconds' (seconds=30), 'go back a minute' (seconds=-60), 'rewind 15 seconds' (seconds=-15). Not for live radio.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {"seconds": {"type": "NUMBER", "description": "Seconds to move; negative = backwards."}},
+                "required": ["seconds"],
+            },
         },
     ]
 
@@ -627,9 +1054,12 @@ def build_gemini_config():
             "4. PLAY SINGLE SONG: When the user asks to play a specific single song or artist track immediately ('play Billie Jean', 'put on Daft Punk'), use `searchAndPlay`. The tool will automatically pick the best track.\n"
             "5. SKIP / NEXT TRACK: If the user simply says 'skip', 'next', or 'next track' without specifying a song to queue, use `nextTrack`.\n"
             "6. PAUSE / RESUME: Use `pausePlayback` and `resumePlayback`.\n"
+            "7. VOLUME: 'turn it up/down', 'louder', 'quieter', 'volume 40 percent', 'mute' -> you MUST call `setVolume`. "
+            "You cannot change the volume any other way; never say you adjusted it unless the tool was called and confirmed it.\n"
             "Do NOT ask the user to choose; automatically pick the best matching track or playlist.\n"
         )
         system_instruction += PLAYLIST_MANAGEMENT_INSTRUCTIONS
+        system_instruction += RADIO_PODCAST_INSTRUCTIONS + AUDIOBOOK_STREAMING_INSTRUCTIONS + _sources_summary() + "\n"
         tool_declarations.append({
             "name": "searchAndPlay",
             "description": "Searches the library for a genre, artist, or title, and IMMEDIATELY plays the best matching track.",
@@ -668,9 +1098,11 @@ def build_gemini_config():
             "Never suggest playing a song that isn't in this library. "
             f"Track IDs are strings starting with 't_'.\n"
             "When the user asks for music by decade or genre, use `createAndPlayPlaylist`.\n"
-            "When the user asks to cue or queue a song to play next (using keywords like 'queue', 'cue', 'next'), use `queueTrack`."
+            "When the user asks to cue or queue a song to play next (using keywords like 'queue', 'cue', 'next'), use `queueTrack`.\n"
+            "For 'turn it up/down', 'louder', 'quieter', 'volume 40 percent', 'mute' you MUST call `setVolume`; never claim to have changed the volume otherwise."
         )
         system_instruction += PLAYLIST_MANAGEMENT_INSTRUCTIONS
+        system_instruction += RADIO_PODCAST_INSTRUCTIONS + AUDIOBOOK_STREAMING_INSTRUCTIONS + _sources_summary() + "\n"
 
     return {
         "response_modalities": ["AUDIO"],
@@ -692,7 +1124,9 @@ async def cache_headers(request: Request, call_next):
     silently break the protocol after an update (revalidation still gets
     cheap 304s via ETag)."""
     response = await call_next(request)
-    response.headers["Cache-Control"] = "no-cache"
+    # Live relays mark themselves no-store (stronger); don't weaken that.
+    if response.headers.get("cache-control") != "no-store":
+        response.headers["Cache-Control"] = "no-cache"
     return response
 
 
@@ -706,11 +1140,44 @@ async def get_favicon():
     return Response(content=b"", media_type="image/x-icon")
 
 
+def _scan_status() -> dict:
+    return {
+        "scanning": not scan_complete,
+        "phase": scan_progress.get("phase"),
+        "found": scan_progress.get("found", 0),
+        "read": scan_progress.get("read", 0),
+        "tracks": len(music_library) if scan_complete else None,
+        "audiobooksScanning": not audiobooks_scan_complete,
+        "audiobooks": len(audiobook_library) if audiobooks_scan_complete else None,
+        "elapsed": round(time.time() - scan_progress["startedAt"], 1) if scan_progress.get("startedAt") and not scan_complete else None,
+        "error": scan_progress.get("error"),
+    }
+
+
+@app.get("/api/status")
+async def get_status():
+    """Start-up progress for the browser's loading message."""
+    return JSONResponse(_scan_status())
+
+
 @app.get("/api/tracks")
 async def get_tracks():
     if not scan_complete:
-        return JSONResponse({"status": "scanning", "tracks": []}, status_code=503)
+        return JSONResponse({**_scan_status(), "status": "scanning", "tracks": []}, status_code=503)
     return JSONResponse(music_library)
+
+
+@app.post("/api/tracks/rescan")
+async def rescan_tracks_endpoint():
+    """Re-scan MUSIC_DIR (new files are read, unchanged ones come from the cache)."""
+    if not scan_complete:
+        return JSONResponse({"error": "A scan is already running"}, status_code=409)
+    globals()["scan_complete"] = False
+    try:
+        n = await rescan_music_library()
+    finally:
+        globals()["scan_complete"] = True
+    return JSONResponse({"count": n})
 
 
 # ─── Playlists API ────────────────────────────────────────────────────────────
@@ -794,6 +1261,363 @@ async def remove_track_from_playlist_endpoint(playlist_id: str, track_id: str):
 
 
 
+# ─── Live Radio API ───────────────────────────────────────────────────────────
+
+RADIO_CHUNK_SIZE = 16 * 1024          # small relay chunks keep live latency low
+UPSTREAM_CONNECT_TIMEOUT = 10.0
+
+
+def _http_client(timeout: float = UPSTREAM_CONNECT_TIMEOUT) -> httpx.AsyncClient:
+    """Outbound client for radio/podcast relays and directory lookups.
+    Tests swap this for a client with a mock transport."""
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout, read=30.0),
+        follow_redirects=True,
+        headers={"User-Agent": radio_manager.USER_AGENT},
+    )
+
+
+def _directory_disabled() -> JSONResponse:
+    return JSONResponse({"error": "Online directories are disabled (ONLINE_DIRECTORIES=false).", "results": []}, status_code=503)
+
+
+async def _search_stations(query: str, country: str = "", place: str = "", limit: int = 12,
+                           client: httpx.AsyncClient | None = None) -> list[dict]:
+    """Both directories, merged: radio-browser (verified first) then TuneIn for
+    whatever the community directory lacks (typically local commercial radio)."""
+    own = client is None
+    client = client or _http_client(timeout=6.0)
+    try:
+        primary = await radio_manager.search_directory(query, country=country, limit=limit, client=client, place=place)
+        secondary = []
+        if TUNEIN_DIRECTORY and query:
+            tq = f"{query} {place}".strip() if place else query
+            secondary = await radio_manager.search_tunein(tq, limit=limit, client=client)
+            if not secondary and place:
+                secondary = await radio_manager.search_tunein(query, limit=limit, client=client)
+        return radio_manager.merge_directory_results(primary, secondary, limit)
+    finally:
+        if own:
+            await client.aclose()
+
+
+async def _prepare_station_for_saving(raw: dict, client: httpx.AsyncClient | None = None) -> dict:
+    """TuneIn results point at a Tune.ashx link; resolve it to a direct stream
+    (kept in `resolvedUrl`, the Tune link stays the stable id)."""
+    st = dict(raw)
+    url = str(st.get("streamUrl") or "")
+    if radio_manager.is_tunein_url(url) and not st.get("resolvedUrl"):
+        own = client is None
+        client = client or _http_client(timeout=8.0)
+        try:
+            resolved = await radio_manager.resolve_tunein_url(url, client=client)
+        finally:
+            if own:
+                await client.aclose()
+        if resolved:
+            st["resolvedUrl"] = resolved
+    return st
+
+
+@app.get("/api/radio")
+async def list_radio_stations():
+    return JSONResponse(radio_manager.get_all_stations())
+
+
+@app.get("/api/radio/search")
+async def search_radio_directory(q: str = "", country: str = "", place: str = ""):
+    """Station search across both directories; `place` = city/region."""
+    if not ONLINE_DIRECTORIES:
+        return _directory_disabled()
+    results = await _search_stations(q, country=country, place=place, limit=12)
+    return JSONResponse({"results": results, "providers": ["radio-browser"] + (["tunein"] if TUNEIN_DIRECTORY else [])})
+
+
+@app.get("/api/radio/browse")
+async def browse_radio_directory(kind: str = "popular", value: str = ""):
+    """Directory browsing without a query: kind=popular | tag&value=jazz | country&value=France."""
+    if not ONLINE_DIRECTORIES:
+        return _directory_disabled()
+    async with _http_client(timeout=6.0) as client:
+        results = await radio_manager.browse_directory(kind, value, limit=20, client=client)
+    return JSONResponse({"results": results, "kind": kind, "value": value,
+                         "genres": [{"label": l, "tag": t} for l, t in radio_manager.BROWSE_GENRES]})
+
+
+@app.post("/api/radio")
+async def add_radio_station_endpoint(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    raw = data if isinstance(data, dict) else {}
+    if re.match(r"^https?://", str(raw.get("streamUrl") or ""), re.IGNORECASE):
+        raw = await _prepare_station_for_saving(raw)
+    station, created = radio_manager.add_station(raw, source=str(raw.get("source") or "user"))
+    if not station:
+        return JSONResponse({"error": "A valid http(s) streamUrl is required"}, status_code=400)
+    return JSONResponse(station, status_code=201 if created else 200)
+
+
+@app.get("/api/radio/{station_id}")
+async def get_radio_station(station_id: str):
+    st = radio_manager.get_station_by_id(station_id)
+    if not st:
+        return JSONResponse({"error": "Station not found"}, status_code=404)
+    return JSONResponse(st)
+
+
+@app.put("/api/radio/{station_id}")
+async def update_radio_station_endpoint(station_id: str, request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    updated = radio_manager.update_station(
+        station_id,
+        **{k: data.get(k) for k in ("name", "genre", "country", "homepage", "favicon", "description")},
+    )
+    if not updated:
+        return JSONResponse({"error": "Station not found"}, status_code=404)
+    return JSONResponse(updated)
+
+
+@app.delete("/api/radio/{station_id}")
+async def delete_radio_station_endpoint(station_id: str):
+    if not radio_manager.delete_station(station_id):
+        return JSONResponse({"error": "Station not found"}, status_code=404)
+    radio_now_playing.pop(station_id, None)
+    return JSONResponse({"success": True})
+
+
+@app.get("/api/radio/{station_id}/now")
+async def radio_now(station_id: str):
+    """Latest ICY 'StreamTitle' seen while relaying this station (if any)."""
+    info = radio_now_playing.get(station_id) or {}
+    return JSONResponse({"stationId": station_id, "title": info.get("title"), "updatedAt": info.get("updatedAt")})
+
+
+async def _open_upstream_stream(client: httpx.AsyncClient, url: str, headers: dict, max_hops: int = 3):
+    """GET `url` as a stream. If the server hands back a .pls/.m3u playlist,
+    follow it to the first real stream URL. Returns (response, error)."""
+    for _ in range(max_hops):
+        req = client.build_request("GET", url, headers=headers)
+        resp = await client.send(req, stream=True)
+        ctype = resp.headers.get("content-type", "")
+        final_url = str(resp.url)
+        if resp.status_code >= 400:
+            await resp.aclose()
+            return None, f"Upstream answered HTTP {resp.status_code}"
+        if radio_manager.is_hls(ctype, final_url):
+            await resp.aclose()
+            return None, "HLS (.m3u8) streams are not supported"
+        if radio_manager.is_playlist_response(ctype, final_url):
+            body = bytearray()
+            async for chunk in resp.aiter_bytes(8192):
+                body += chunk
+                if len(body) >= 64 * 1024:
+                    break
+            await resp.aclose()
+            urls = radio_manager.extract_stream_urls(body.decode("utf-8", errors="replace"))
+            if not urls:
+                return None, "Playlist file contained no stream URL"
+            url = urls[0]
+            continue
+        return resp, None
+    return None, "Too many playlist redirections"
+
+
+@app.get("/api/radio/{station_id}/stream")
+async def stream_radio(station_id: str):
+    """Same-origin relay of a live station. Needed because the browser routes
+    <audio> through Web Audio (ducking/visualiser), which silences cross-origin
+    media without CORS. ICY metadata is stripped and its StreamTitle kept in
+    `radio_now_playing` for the GUI and the describeNowPlaying tool."""
+    st = radio_manager.get_station_by_id(station_id)
+    if not st:
+        return JSONResponse({"error": "Station not found"}, status_code=404)
+
+    client = _http_client()
+    stream_url = st.get("resolvedUrl") or st["streamUrl"]
+    if radio_manager.is_tunein_url(stream_url):
+        # Saved before resolution succeeded (or a stale link): resolve now.
+        resolved = await radio_manager.resolve_tunein_url(stream_url, client=client)
+        if resolved:
+            stream_url = resolved
+            radio_manager.update_station(station_id, resolvedUrl=resolved)
+        else:
+            await client.aclose()
+            return JSONResponse({"error": "TuneIn offers this station only as an HLS stream (or is unreachable), which cannot be relayed"}, status_code=415)
+    try:
+        resp, err = await _open_upstream_stream(client, stream_url, {"Icy-MetaData": "1", "Accept": "*/*"})
+        if err and st.get("resolvedUrl") and radio_manager.is_tunein_url(st["streamUrl"]):
+            # The direct URL may have rotated: ask TuneIn again once.
+            fresh = await radio_manager.resolve_tunein_url(st["streamUrl"], client=client)
+            if fresh and fresh != stream_url:
+                radio_manager.update_station(station_id, resolvedUrl=fresh)
+                resp, err = await _open_upstream_stream(client, fresh, {"Icy-MetaData": "1", "Accept": "*/*"})
+    except httpx.RemoteProtocolError as e:
+        await client.aclose()
+        return JSONResponse({"error": f"Station answered with a legacy SHOUTcast/ICY response that cannot be relayed ({e})"}, status_code=502)
+    except httpx.HTTPError as e:
+        await client.aclose()
+        return JSONResponse({"error": f"Could not connect to the station ({e.__class__.__name__})"}, status_code=502)
+    if err:
+        await client.aclose()
+        return JSONResponse({"error": err}, status_code=415 if "HLS" in err else 502)
+
+    media_type = (resp.headers.get("content-type") or "audio/mpeg").split(";")[0].strip() or "audio/mpeg"
+    try:
+        metaint = int(resp.headers.get("icy-metaint") or 0)
+    except ValueError:
+        metaint = 0
+    parser = radio_manager.IcyMetadataParser(metaint) if metaint > 0 else None
+    radio_now_playing[station_id] = {"title": None, "updatedAt": int(time.time())}
+    radio_manager.mark_played(station_id)
+
+    async def relay():
+        try:
+            async for chunk in resp.aiter_bytes(RADIO_CHUNK_SIZE):
+                if parser is not None:
+                    chunk = parser.feed(chunk)
+                    new_title = parser.take_title_change()
+                    if new_title is not None:
+                        radio_now_playing[station_id] = {"title": new_title, "updatedAt": int(time.time())}
+                if chunk:
+                    yield chunk
+        except httpx.HTTPError as e:
+            print(f"[Radio] Relay for '{st['name']}' ended: {e.__class__.__name__}")
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        relay(), media_type=media_type,
+        headers={"Cache-Control": "no-store", "Accept-Ranges": "none", "X-Accel-Buffering": "no"},
+    )
+
+
+# ─── Podcasts API ─────────────────────────────────────────────────────────────
+
+@app.get("/api/podcasts")
+async def list_podcasts():
+    return JSONResponse(podcast_manager.get_all_podcasts())
+
+
+@app.get("/api/podcasts/latest")
+async def latest_podcast_episodes(limit: int = 20, per: int = 1):
+    """Newest episodes across all subscriptions (the 'what's new' workflow)."""
+    return JSONResponse({"items": podcast_manager.latest_episodes(limit=max(1, min(int(limit), 100)), per_podcast=max(1, min(int(per), 5)))})
+
+
+@app.get("/api/podcasts/search")
+async def search_podcast_directory(q: str = ""):
+    if not ONLINE_DIRECTORIES:
+        return _directory_disabled()
+    async with _http_client(timeout=8.0) as client:
+        results = await podcast_manager.search_directory(q, limit=10, client=client)
+    return JSONResponse({"results": results})
+
+
+@app.post("/api/podcasts")
+async def subscribe_podcast_endpoint(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    feed_url = str((data or {}).get("feedUrl", "")).strip()
+    if not re.match(r"^https?://", feed_url, re.IGNORECASE):
+        return JSONResponse({"error": "A valid http(s) feedUrl is required"}, status_code=400)
+    try:
+        async with _http_client(timeout=15.0) as client:
+            parsed = await podcast_manager.fetch_feed(feed_url, client=client)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    podcast, created = podcast_manager.upsert_podcast(parsed)
+    return JSONResponse(podcast, status_code=201 if created else 200)
+
+
+@app.get("/api/podcasts/{podcast_id}")
+async def get_podcast(podcast_id: str):
+    pod = podcast_manager.get_podcast_by_id(podcast_id)
+    if not pod:
+        return JSONResponse({"error": "Podcast not found"}, status_code=404)
+    return JSONResponse(pod)
+
+
+@app.post("/api/podcasts/{podcast_id}/refresh")
+async def refresh_podcast_endpoint(podcast_id: str):
+    async with _http_client(timeout=15.0) as client:
+        pod, err = await podcast_manager.refresh_podcast(podcast_id, client=client)
+    if not pod:
+        return JSONResponse({"error": err or "Podcast not found"}, status_code=404)
+    if err:
+        return JSONResponse({**pod, "refreshError": err}, status_code=200)
+    return JSONResponse(pod)
+
+
+@app.delete("/api/podcasts/{podcast_id}")
+async def delete_podcast_endpoint(podcast_id: str):
+    if not podcast_manager.delete_podcast(podcast_id):
+        return JSONResponse({"error": "Podcast not found"}, status_code=404)
+    return JSONResponse({"success": True})
+
+
+@app.get("/api/podcasts/{podcast_id}/episodes/{episode_id}/stream")
+async def stream_podcast_episode(podcast_id: str, episode_id: str,
+                                 range_header: str | None = Header(None, alias="Range")):
+    """Same-origin relay of an episode file, forwarding the browser's Range
+    header so seeking and resume work exactly as with local tracks."""
+    pod = podcast_manager.get_podcast_by_id(podcast_id)
+    if not pod:
+        return JSONResponse({"error": "Podcast not found"}, status_code=404)
+    ep = next((e for e in pod.get("episodes", []) if e.get("id") == episode_id), None)
+    if not ep:
+        return JSONResponse({"error": "Episode not found"}, status_code=404)
+
+    return await _relay_remote_file(ep["audioUrl"], range_header, label=ep["title"], tag="Podcasts",
+                                    what="the episode", default_type=ep.get("mimeType") or "audio/mpeg")
+
+
+async def _relay_remote_file(url: str, range_header: str | None, label: str, tag: str,
+                             what: str = "the file", default_type: str = "audio/mpeg", extra_headers: dict | None = None):
+    """Same-origin relay of a remote media file (podcast episode, streaming
+    clip…), forwarding the browser's Range header so seeking works."""
+    headers = {"Accept": "*/*", **(extra_headers or {})}
+    if range_header:
+        headers["Range"] = range_header
+    client = _http_client(timeout=15.0)
+    try:
+        req = client.build_request("GET", url, headers=headers)
+        resp = await client.send(req, stream=True)
+    except httpx.HTTPError as e:
+        await client.aclose()
+        return JSONResponse({"error": f"Could not fetch {what} ({e.__class__.__name__})"}, status_code=502)
+    if resp.status_code >= 400:
+        status = resp.status_code
+        await resp.aclose()
+        await client.aclose()
+        return JSONResponse({"error": f"{what[0].upper() + what[1:]} host answered HTTP {status}"}, status_code=502)
+
+    media_type = (resp.headers.get("content-type") or default_type).split(";")[0].strip()
+    passthrough = {k: resp.headers[k] for k in ("content-length", "content-range", "accept-ranges", "last-modified", "etag")
+                   if k in resp.headers}
+    passthrough.setdefault("accept-ranges", "bytes")
+
+    async def relay():
+        try:
+            async for chunk in resp.aiter_bytes(STREAM_CHUNK_SIZE):
+                yield chunk
+        except httpx.HTTPError as e:
+            print(f"[{tag}] Relay for '{label}' ended: {e.__class__.__name__}")
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(relay(), status_code=206 if resp.status_code == 206 else 200,
+                             media_type=media_type, headers=passthrough)
+
+
 def _parse_range(range_header: str | None, size: int) -> tuple[int, int] | None:
     """Parse 'bytes=start-end'. Returns (start, end) inclusive, or None."""
     if not range_header:
@@ -819,6 +1643,13 @@ def _parse_range(range_header: str | None, size: int) -> tuple[int, int] | None:
     return (start, min(end, size - 1))
 
 
+LOCAL_MEDIA_TYPES = {
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac",
+    ".m4a": "audio/mp4", ".m4b": "audio/mp4", ".ogg": "audio/ogg", ".opus": "audio/ogg",
+    ".aac": "audio/aac", ".wma": "audio/x-ms-wma",
+}
+
+
 @app.get("/api/tracks/{track_id}/stream")
 async def stream_track(track_id: str, range_header: str | None = Header(None, alias="Range")):
     track = tracks_by_id.get(track_id)
@@ -827,13 +1658,12 @@ async def stream_track(track_id: str, range_header: str | None = Header(None, al
     path = MUSIC_DIR / track["filename"]
     if not path.exists():
         return JSONResponse({"error": "File not found on disk"}, status_code=404)
+    return _stream_local_file(path, range_header)
 
-    media_map = {
-        ".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac",
-        ".m4a": "audio/mp4", ".ogg": "audio/ogg", ".aac": "audio/aac",
-        ".wma": "audio/x-ms-wma",
-    }
-    media_type = media_map.get(path.suffix.lower(), "application/octet-stream")
+
+def _stream_local_file(path: Path, range_header: str | None):
+    """Local audio file with full HTTP Range support (seeking / resume)."""
+    media_type = LOCAL_MEDIA_TYPES.get(path.suffix.lower(), "application/octet-stream")
     size = path.stat().st_size
 
     rng = _parse_range(range_header, size)
@@ -906,6 +1736,158 @@ async def get_track_art(track_id: str):
     return JSONResponse({"error": "No artwork available"}, status_code=404)
 
 
+# ─── Audiobooks API ───────────────────────────────────────────────────────────
+
+def _audiobook_or_404(book_id: str):
+    book = audiobooks_by_id.get(book_id)
+    if not book:
+        return None, JSONResponse({"error": "Audiobook not found"}, status_code=404)
+    return book, None
+
+
+@app.get("/api/audiobooks")
+async def list_audiobooks():
+    """All books (summaries with progress) plus whether the feature is set up."""
+    progress = audiobook_manager.load_progress()
+    return JSONResponse({
+        "configured": AUDIOBOOKS_DIR is not None,
+        "directoryExists": bool(AUDIOBOOKS_DIR and AUDIOBOOKS_DIR.exists()),
+        "scanning": not audiobooks_scan_complete,
+        "books": [audiobook_manager.summarize(b, progress.get(b["id"])) for b in audiobook_library],
+    })
+
+
+@app.post("/api/audiobooks/rescan")
+async def rescan_audiobooks_endpoint():
+    if AUDIOBOOKS_DIR is None:
+        return JSONResponse({"error": "AUDIOBOOKS_DIR is not set in backend/.env"}, status_code=503)
+    n = await rescan_audiobooks()
+    return JSONResponse({"count": n})
+
+
+@app.get("/api/audiobooks/{book_id}")
+async def get_audiobook(book_id: str):
+    book, err = _audiobook_or_404(book_id)
+    if err:
+        return err
+    return JSONResponse(audiobook_manager.with_chapters(book, audiobook_manager.get_progress(book_id)))
+
+
+@app.put("/api/audiobooks/{book_id}/progress")
+async def update_audiobook_progress(book_id: str, request: Request):
+    """Browser reports where the listener is (chapter + seconds)."""
+    book, err = _audiobook_or_404(book_id)
+    if err:
+        return err
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    try:
+        entry = audiobook_manager.update_progress(
+            book, str(data.get("chapterId") or ""), float(data.get("position") or 0),
+            float(data["duration"]) if data.get("duration") else None,
+        )
+    except (ValueError, TypeError) as e:
+        return JSONResponse({"error": str(e) or "Invalid progress"}, status_code=400)
+    return JSONResponse(entry)
+
+
+@app.delete("/api/audiobooks/{book_id}/progress")
+async def reset_audiobook_progress(book_id: str):
+    book, err = _audiobook_or_404(book_id)
+    if err:
+        return err
+    audiobook_manager.reset_progress(book_id)
+    return JSONResponse({"success": True})
+
+
+@app.get("/api/audiobooks/{book_id}/art")
+async def get_audiobook_art(book_id: str):
+    """Cover: cover.jpg/folder.jpg in the book folder, else art embedded in the first chapter."""
+    book, err = _audiobook_or_404(book_id)
+    if err:
+        return err
+    if book.get("cover"):
+        path = AUDIOBOOKS_DIR / book["cover"]
+        if path.exists():
+            with open(path, "rb") as f:
+                head = f.read(16)
+            return FileResponse(path, media_type=_detect_image_mime(head))
+    for ch in book.get("chapters") or []:
+        art = extract_local_art(AUDIOBOOKS_DIR / ch["filename"])
+        if art:
+            return Response(content=art[0], media_type=art[1])
+        break
+    return JSONResponse({"error": "No cover available"}, status_code=404)
+
+
+@app.get("/api/audiobooks/{book_id}/chapters/{chapter_id}/stream")
+async def stream_audiobook_chapter(book_id: str, chapter_id: str, range_header: str | None = Header(None, alias="Range")):
+    book, err = _audiobook_or_404(book_id)
+    if err:
+        return err
+    ch = next((c for c in book.get("chapters") or [] if c["id"] == chapter_id), None)
+    if not ch:
+        return JSONResponse({"error": "Chapter not found"}, status_code=404)
+    path = AUDIOBOOKS_DIR / ch["filename"]
+    if not path.exists():
+        return JSONResponse({"error": "File not found on disk"}, status_code=404)
+    return _stream_local_file(path, range_header)
+
+
+# ─── Streaming API ────────────────────────────────────────────────────────────
+# Online streaming sources, one sub-section per provider in the GUI: Apple
+# Music and Deezer previews (keyless) and YouTube Music full songs via the
+# third-party tools ytmusicapi + yt-dlp. Audio is always relayed by the
+# backend so it runs through the deck's Web Audio graph.
+
+@app.get("/api/streaming/status")
+async def streaming_status():
+    return JSONResponse(streaming_manager.status())
+
+
+@app.get("/api/streaming/search")
+async def streaming_search(q: str = "", providers: str = "", limit: int = 10, offset: int = 0):
+    """Search every (or the listed) providers in parallel: [{provider, tracks,
+    albums, error, offset, limit, hasMore}]. `offset` pages one provider's songs."""
+    wanted = [p.strip() for p in providers.split(",") if p.strip()] or None
+    lim = max(1, min(int(limit), 50))
+    async with _http_client(timeout=8.0) as client:
+        results = await streaming_manager.search_all(q, client, limit=lim, providers=wanted, offset=max(0, int(offset)))
+    return JSONResponse({"query": q, "results": results})
+
+
+@app.get("/api/streaming/albums/{album_id}/tracks")
+async def streaming_album_tracks(album_id: str):
+    async with _http_client(timeout=8.0) as client:
+        tracks = await streaming_manager.album_tracks(album_id, client)
+    return JSONResponse({"tracks": tracks})
+
+
+@app.get("/api/streaming/tracks/{track_id}")
+async def streaming_track(track_id: str):
+    t = streaming_manager.track_cache.get(track_id)
+    if not t:
+        return JSONResponse({"error": "Unknown track; search again."}, status_code=404)
+    return JSONResponse(t)
+
+
+@app.get("/api/streaming/tracks/{track_id}/audio")
+async def streaming_audio(track_id: str, range_header: str | None = Header(None, alias="Range")):
+    """Same-origin relay of a track's audio (preview clip, or the yt-dlp
+    stream for YouTube Music) with Range pass-through for seeking."""
+    t = streaming_manager.track_cache.get(track_id)
+    if not t:
+        return JSONResponse({"error": "Unknown track; search again."}, status_code=404)
+    try:
+        src = await streaming_manager.resolve_audio(t)
+    except streaming_manager.StreamingError as e:
+        return JSONResponse({"error": str(e)}, status_code=e.status)
+    return await _relay_remote_file(src["url"], range_header, label=t["title"], tag="Streaming", what="the audio stream",
+                                    default_type=src.get("mime") or "audio/mpeg", extra_headers=src.get("headers") or {})
+
+
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 
@@ -918,8 +1900,11 @@ class ClientConn:
         self.ws = ws
         # Real playback state, reported by the browser; included in tool
         # responses so Gemini sees the truth instead of a fabricated Success.
-        self.playback = {"playing": False, "track_id": None, "queue": [], "playlist": None}
+        self.playback = {"playing": False, "track_id": None, "queue": [], "playlist": None, "source": None}
         self.audio_bytes_since_turn = 0
+        # Directory stations tuned in this session (full records, so a later
+        # "save this station" works even before the browser reports back).
+        self.directory_stations: dict[str, dict] = {}
 
     async def send_json(self, obj) -> bool:
         try:
@@ -935,9 +1920,71 @@ class ClientConn:
         return await self.send_json(msg)
 
     def now_playing(self) -> dict | None:
-        """The track the browser reports as loaded, or None."""
+        """The library track the browser reports as loaded, or None (also None
+        while a radio station or podcast episode is playing)."""
+        if self.current_source():
+            return None
         tid = self.playback.get("track_id")
         return tracks_by_id.get(tid) if tid else None
+
+    def current_source(self) -> dict | None:
+        """The non-library source the browser is playing: {"type": "radio"|"podcast", ...} or None."""
+        src = self.playback.get("source")
+        if isinstance(src, dict) and src.get("type") in SOURCE_TYPES:
+            return src
+        return None
+
+    def radio_on_air_title(self) -> str | None:
+        """Song title announced by the playing station (ICY metadata seen by the
+        relay, else whatever the browser last reported)."""
+        src = self.current_source()
+        if not src or src.get("type") != "radio":
+            return None
+        info = radio_now_playing.get(src.get("id") or "") or {}
+        return info.get("title") or src.get("nowTitle") or None
+
+    def source_summary(self) -> str:
+        """One-sentence truth about the radio/podcast source, for tool results."""
+        src = self.current_source()
+        if not src:
+            return ""
+        state = "playing" if self.playback.get("playing") else "paused"
+        if src["type"] == "radio":
+            text = f"Now {state}: live radio station '{src.get('name')}'"
+            if src.get("genre"):
+                text += f" ({src['genre']})"
+            title = self.radio_on_air_title()
+            text += f". On air right now: '{title}'." if title else ". The station has not announced the current song title."
+            if not src.get("saved", True):
+                text += " This station came from the online directory and is not saved yet."
+            return text
+        if src["type"] == "audiobook":
+            text = f"Now {state}: audiobook '{src.get('name')}'"
+            if src.get("author"):
+                text += f" by {src['author']}"
+            ch_idx, ch_total = src.get("chapterIndex"), src.get("chapterCount")
+            if ch_idx:
+                text += f", chapter {ch_idx}" + (f" of {ch_total}" if ch_total else "")
+            if src.get("chapterTitle") and str(src["chapterTitle"]).lower() != str(src.get("name", "")).lower():
+                text += f" ('{src['chapterTitle']}')"
+        elif src["type"] == "stream":
+            text = f"Now {state}: streamed track '{src.get('title')}' by {src.get('artist')}"
+            if src.get("album"):
+                text += f" from the album '{src['album']}'"
+            if src.get("contextName") and src.get("contextType") in ("album", "artist"):
+                text += f" (from {src['contextType']} '{src['contextName']}')"
+            text += f" — {streaming_manager.provider_name(src.get('provider', ''))}, " + ("full song" if src.get("full") else "30-second preview clip")
+        else:
+            text = f"Now {state}: podcast episode '{src.get('episodeTitle')}' from '{src.get('name')}'"
+        pos, dur = src.get("position"), src.get("duration")
+        if isinstance(pos, (int, float)) and pos >= 0:
+            text += f", at {_fmt_clock(pos)}"
+            if isinstance(dur, (int, float)) and dur > 0:
+                text += f" of {_fmt_clock(dur)}"
+        rate = float(self.playback.get("playbackRate") or 1.0)
+        if abs(rate - 1.0) > 0.01 and src["type"] in SEEKABLE_SOURCE_TYPES and src["type"] != "stream":
+            text += f", at {rate:g}x speed"
+        return text + "."
 
     def active_playlist_status(self) -> tuple[dict | None, bool]:
         """(active playlist as reported by the browser, is the current track one of its songs?).
@@ -965,7 +2012,11 @@ class ClientConn:
         active, in_pl = self.active_playlist_status()
         state = "playing" if self.playback.get("playing") else "paused"
 
-        if trk:
+        if self.current_source():
+            parts.append(self.source_summary())
+            if active:
+                parts.append(f"Playlist '{active.get('name')}' is on hold; its remaining songs are still cued.")
+        elif trk:
             parts.append(f"Now {state}: '{trk['title']}' by {trk['artist']}.")
             if active:
                 if in_pl:
@@ -979,15 +2030,9 @@ class ClientConn:
 
         queue = self.playback.get("queue") or []
         if queue:
-            next_item = queue[0]
-            next_id = next_item if isinstance(next_item, str) else next_item.get("id")
-            next_trk = tracks_by_id.get(next_id)
-            if next_trk:
-                parts.append(f"Next in queue: '{next_trk['title']}' by {next_trk['artist']}.")
-            else:
-                parts.append(f"Next in queue: track {next_id}.")
+            parts.append(f"Next in queue: {_queue_entry_label(queue[0])}.")
             if len(queue) > 1:
-                parts.append(f"({len(queue)} songs queued in total).")
+                parts.append(f"({len(queue)} items queued in total).")
         else:
             parts.append("Queue is currently empty.")
         return " ".join(parts)
@@ -1180,6 +2225,10 @@ def _resolve_track(
         return trk, None
 
     if _is_current_track_ref(query):
+        src = conn.current_source()
+        if src:
+            what = SOURCE_NOUNS.get(src["type"], "a non-library source")
+            return None, f"{what[0].upper() + what[1:]} is playing, not a library song, so 'this song' cannot be added to a playlist. Ask the user for the song title."
         now_id = conn.playback.get("track_id")
         trk = tracks_by_id.get(now_id) if now_id else None
         if not trk:
@@ -1455,12 +2504,18 @@ async def _tool_save_queue_as_playlist(conn: ClientConn, fc) -> dict:
     track_ids: list[str] = []
     if include_current and conn.playback.get("track_id") in tracks_by_id:
         track_ids.append(conn.playback["track_id"])
+    skipped: dict[str, int] = {}
     for item in conn.playback.get("queue") or []:
         tid = item if isinstance(item, str) else (item or {}).get("id")
-        if tid in tracks_by_id and tid not in track_ids:
-            track_ids.append(tid)
+        if tid in tracks_by_id:
+            if tid not in track_ids:
+                track_ids.append(tid)
+        elif tid:
+            # podcast episodes, audiobook chapters, streamed tracks cannot live in a local playlist
+            kind = str((item if isinstance(item, dict) else {}).get("kind") or "other")
+            skipped[kind] = skipped.get(kind, 0) + 1
     if not track_ids:
-        return {"result": "Nothing is playing and the queue is empty, so there is nothing to save. Ask the user to cue up some songs first."}
+        return {"result": "Nothing is playing and the queue has no library songs, so there is nothing to save as a playlist. Ask the user to cue up some songs first."}
 
     default_name = f"Session Mix ({time.strftime('%b %d, %H:%M')})"
     name = _clean_new_name(str(args.get("name", "")), fallback=default_name)
@@ -1480,7 +2535,20 @@ async def _tool_save_queue_as_playlist(conn: ClientConn, fc) -> dict:
 
     listing = "; ".join(f"{i + 1}. '{tracks_by_id[tid]['title']}' by {tracks_by_id[tid]['artist']}" for i, tid in enumerate(track_ids[:15]))
     more = f"; …and {len(track_ids) - 15} more" if len(track_ids) > 15 else ""
-    return {"result": f"{msg} It is now the active playlist. Its tracks, in order: {listing}{more}."}
+    skipped_note = f" ({_skipped_kinds_label(skipped)} left out — playlists hold local songs only.)" if skipped else ""
+    return {"result": f"{msg} It is now the active playlist. Its tracks, in order: {listing}{more}.{skipped_note}"}
+
+
+_SKIPPED_KIND_NOUNS = {"podcast": ("podcast episode", "podcast episodes"), "audiobook": ("audiobook chapter", "audiobook chapters"),
+                       "stream": ("streamed track", "streamed tracks")}
+
+
+def _skipped_kinds_label(skipped: dict[str, int]) -> str:
+    parts = []
+    for kind, n in skipped.items():
+        one, many = _SKIPPED_KIND_NOUNS.get(kind, ("non-library item", "non-library items"))
+        parts.append(f"{n} cued {one if n == 1 else many}")
+    return " and ".join(parts)
 
 
 async def _tool_search_and_queue(conn: ClientConn, fc) -> dict:
@@ -1522,15 +2590,51 @@ async def _tool_prev(conn: ClientConn, fc) -> dict:
 
 # ── Queue voice tools ─────────────────────────────────────────────────────────
 
-def _queue_tracks(conn: ClientConn) -> list[dict]:
-    """The browser-reported queue, resolved to library track dicts (in order)."""
+def _queue_entries(conn: ClientConn) -> list[dict]:
+    """The browser-reported queue as uniform entries, in order. Library tracks
+    resolve to their catalogue data; other kinds (podcast episodes cued from
+    the GUI) keep what the browser reported: {id, title, artist, kind}."""
     out = []
     for item in conn.playback.get("queue") or []:
-        tid = item if isinstance(item, str) else (item or {}).get("id")
+        if isinstance(item, str):
+            item = {"id": item}
+        item = item or {}
+        tid = item.get("id")
         trk = tracks_by_id.get(tid)
         if trk:
-            out.append(trk)
+            out.append({**trk, "kind": "track"})
+        elif tid:
+            out.append({"id": tid, "title": str(item.get("title") or tid), "artist": str(item.get("artist") or ""),
+                        "album": "", "genre": str(item.get("kind") or ""), "kind": str(item.get("kind") or "unknown")})
     return out
+
+
+def _queue_entry_label(item) -> str:
+    """Spoken label for one queue entry: a song, or e.g. a podcast episode."""
+    entries = _queue_entries_from([item])
+    if not entries:
+        return "an unknown item"
+    e = entries[0]
+    if e["kind"] == "track":
+        return f"'{e['title']}' by {e['artist']}"
+    if e["kind"] == "podcast":
+        return f"podcast episode '{e['title']}'" + (f" from '{e['artist']}'" if e.get("artist") else "")
+    if e["kind"] == "audiobook":
+        return f"audiobook chapter '{e['title']}'" + (f" from '{e['artist']}'" if e.get("artist") else "")
+    if e["kind"] == "stream":
+        return f"streamed track '{e['title']}'" + (f" by {e['artist']}" if e.get("artist") else "")
+    return f"'{e['title']}'"
+
+
+def _queue_entries_from(items: list) -> list[dict]:
+    fake = ClientConn.__new__(ClientConn)
+    fake.playback = {"queue": items}
+    return _queue_entries(fake)
+
+
+def _queue_tracks(conn: ClientConn) -> list[dict]:
+    """Only the library tracks in the queue (what playlists can hold)."""
+    return [e for e in _queue_entries(conn) if e["kind"] == "track"]
 
 
 async def _tool_clear_queue(conn: ClientConn, fc) -> dict:
@@ -1545,7 +2649,7 @@ async def _tool_clear_queue(conn: ClientConn, fc) -> dict:
 
 async def _tool_remove_from_queue(conn: ClientConn, fc) -> dict:
     args = fc.args or {}
-    queued = _queue_tracks(conn)
+    queued = _queue_entries(conn)
     if not queued:
         return {"result": "The queue is empty, there is nothing to remove."}
 
@@ -1574,24 +2678,48 @@ async def _tool_remove_from_queue(conn: ClientConn, fc) -> dict:
             del q[i]
             break
     print(f"[Tool] Removed '{trk['title']}' from queue")
-    return {"result": f"Removed '{trk['title']}' by {trk['artist']} from the queue. {conn.playback_summary()}"}
+    return {"result": f"Removed {_queue_entry_label(trk)} from the queue. {conn.playback_summary()}"}
 
 
 async def _tool_describe_queue(conn: ClientConn, fc) -> dict:
-    queued = _queue_tracks(conn)
-    now_id = conn.playback.get("track_id")
-    now = tracks_by_id.get(now_id) if now_id else None
-    now_part = f"Now {'playing' if conn.playback.get('playing') else 'paused'}: '{now['title']}' by {now['artist']}. " if now else "Nothing is playing. "
+    queued = _queue_entries(conn)
+    now = conn.now_playing()
+    if conn.current_source():
+        now_part = conn.source_summary() + " "
+    else:
+        now_part = f"Now {'playing' if conn.playback.get('playing') else 'paused'}: '{now['title']}' by {now['artist']}. " if now else "Nothing is playing. "
     if not queued:
         return {"result": now_part + "The queue is empty; after this track the library continues in order."}
-    listing = "; ".join(f"{i + 1}. '{t['title']}' by {t['artist']}" for i, t in enumerate(queued[:15]))
+    listing = "; ".join(f"{i + 1}. {_queue_entry_label(t)}" for i, t in enumerate(queued[:15]))
     more = f"; …and {len(queued) - 15} more" if len(queued) > 15 else ""
     pl = conn.playback.get("playlist")
     pl_part = f" (from playlist '{pl.get('name')}')" if isinstance(pl, dict) and pl.get("name") else ""
-    return {"result": f"{now_part}{len(queued)} track{'s' if len(queued) != 1 else ''} cued up{pl_part}, in order: {listing}{more}."}
+    return {"result": f"{now_part}{len(queued)} item{'s' if len(queued) != 1 else ''} cued up{pl_part}, in order: {listing}{more}."}
 
 
 async def _tool_describe_now_playing(conn: ClientConn, fc) -> dict:
+    src = conn.current_source()
+    if src:
+        desc = conn.source_summary()
+        if src["type"] == "radio":
+            desc += " Describe the station and the on-air title; there is no local track, album or playlist to describe."
+        elif src["type"] == "podcast":
+            ep_desc = str(src.get("episodeDescription") or "").strip()
+            if ep_desc:
+                desc += f" Episode notes: {ep_desc[:240]}"
+        elif src["type"] == "audiobook":
+            book = audiobooks_by_id.get(src.get("id") or "")
+            if book:
+                desc += f" Book progress: {audiobook_manager.progress_label(book, audiobook_manager.get_progress(book['id']))}."
+                if book.get("narrator"):
+                    desc += f" Narrated by {book['narrator']}."
+        elif src["type"] == "stream":
+            desc += " This is streamed online, not from the local library, so it cannot be added to a local playlist."
+        queue = conn.playback.get("queue") or []
+        if queue:
+            desc += f" Up next in the queue: {_queue_entry_label(queue[0])}."
+        return {"result": desc}
+
     trk = conn.now_playing()
     active, in_pl = conn.active_playlist_status()
     if not trk:
@@ -1610,11 +2738,786 @@ async def _tool_describe_now_playing(conn: ClientConn, fc) -> dict:
         desc += f" This song is a one-off request and is NOT part of the active playlist '{active.get('name')}'; that playlist's remaining songs are still cued after it."
     queue = conn.playback.get("queue") or []
     if queue:
-        nid = queue[0] if isinstance(queue[0], str) else (queue[0] or {}).get("id")
-        nxt = tracks_by_id.get(nid)
-        if nxt:
-            desc += f" Up next: '{nxt['title']}' by {nxt['artist']}."
+        desc += f" Up next: {_queue_entry_label(queue[0])}."
     return {"result": desc}
+
+
+# ── Live radio & podcast voice tools ──────────────────────────────────────────
+
+_RADIO_REF_FILLER = {"the", "a", "some", "station", "radio", "channel", "stream", "one", "on", "again", "back"}
+_PODCAST_REF_FILLER = {"the", "a", "my", "podcast", "show", "one", "episode", "again"}
+
+
+def _is_generic_radio_request(query: str) -> bool:
+    """'', 'the radio', 'some radio', 'this station again' -> no particular
+    station was named; tune in to the default (last played) one."""
+    tokens = re.findall(r"[a-z0-9]+", re.sub(r"['’]", "", (query or "").lower()))
+    return all(t in _RADIO_REF_FILLER or t in _DEICTIC_WORDS or t in radio_manager.COMMON_FILLER for t in tokens)
+
+
+def _fmt_clock(seconds) -> str:
+    """73 -> '1:13', 3723 -> '1:02:03'."""
+    total = max(0, int(seconds or 0))
+    h, rem = divmod(total, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+def _station_label(st: dict) -> str:
+    extra = ", ".join(x for x in (st.get("genre"), st.get("country")) if x)
+    return f"'{st.get('name')}'" + (f" ({extra})" if extra else "")
+
+
+def _station_summary(st: dict) -> dict:
+    return {k: st.get(k) for k in ("id", "name", "streamUrl", "genre", "country", "homepage", "favicon", "description", "source")}
+
+
+def _podcast_summary(pod: dict) -> dict:
+    return podcast_manager.summarize(pod)
+
+
+def _available_stations_hint(limit: int = 6) -> str:
+    names = [f"'{s['name']}'" for s in radio_manager.load_stations()[:limit]]
+    return f" Saved stations: {', '.join(names)}." if names else " There are no saved stations yet."
+
+
+def _available_podcasts_hint(limit: int = 6) -> str:
+    names = [f"'{p['title']}'" for p in podcast_manager.load_podcasts()[:limit]]
+    return f" Subscriptions: {', '.join(names)}." if names else " There are no podcast subscriptions yet."
+
+
+async def _notify_sources_changed(conn: ClientConn, kind: str, change: str, item: dict | None, message: str):
+    """Tell the browser a station/podcast was added/updated/removed so the
+    Radio / Podcasts tabs refresh and a toast is shown."""
+    if kind == "radio":
+        await conn.send_json({
+            "type": "command", "action": "radioStationsChanged", "change": change,
+            "stationId": item.get("id") if item else None,
+            "station": _station_summary(item) if item else None, "message": message,
+        })
+    else:
+        await conn.send_json({
+            "type": "command", "action": "podcastsChanged", "change": change,
+            "podcastId": item.get("id") if item else None,
+            "podcast": _podcast_summary(item) if item else None, "message": message,
+        })
+
+
+async def _send_play_radio(conn: ClientConn, station: dict, origin: str):
+    """Push a playRadio command and mirror the new source locally so the
+    same-turn playback summary is already right."""
+    await conn.send_json({"type": "command", "action": "playRadio", "station": _station_summary(station), "origin": origin})
+    conn.playback.update({
+        "playing": True, "track_id": None,
+        "source": {"type": "radio", "id": station["id"], "name": station["name"], "genre": station.get("genre", ""),
+                   "streamUrl": station.get("streamUrl"), "saved": origin == "saved"},
+    })
+
+
+def _default_station(stations: list[dict]) -> dict | None:
+    if not stations:
+        return None
+    return max(stations, key=lambda s: (int(s.get("lastPlayedAt") or 0), -stations.index(s)))
+
+
+async def _tool_play_radio(conn: ClientConn, fc) -> dict:
+    args = fc.args or {}
+    query = str(args.get("query") or "").strip()
+    country = str(args.get("country") or "").strip()
+    place = str(args.get("place") or "").strip()
+    stations = radio_manager.load_stations()
+
+    if _is_generic_radio_request(query) and not place:
+        station = _default_station(stations)
+        if not station:
+            if not ONLINE_DIRECTORIES:
+                return {"result": "There are no saved radio stations and the online directory is disabled. Ask the user to add a station (with its stream URL) in the Radio tab."}
+            return {"result": "There are no saved radio stations yet. Ask the user what kind of station they want (a genre or a station name) so the directory can be searched."}
+        await _send_play_radio(conn, station, "saved")
+        print(f"[Tool] Radio: tuned in to saved station '{station['name']}'")
+        return {"result": f"Tuned in to {_station_label(station)} (your {'most recently played' if station.get('lastPlayedAt') else 'most recently added'} station). {conn.playback_summary()}"}
+
+    station = radio_manager.find_station(f"{query} {place}".strip(), stations) if query else None
+    if station:
+        await _send_play_radio(conn, station, "saved")
+        print(f"[Tool] Radio: tuned in to saved station '{station['name']}' for '{query}'")
+        return {"result": f"Tuned in to saved station {_station_label(station)}. {conn.playback_summary()}"}
+
+    if not ONLINE_DIRECTORIES:
+        return {"result": f"No saved station matches '{query}' and the online directory is disabled.{_available_stations_hint()}"}
+
+    async with _http_client(timeout=8.0) as client:
+        results = await _search_stations(query, country=country, place=place, limit=5, client=client)
+        if not results:
+            where = f" in {place}" if place else ""
+            return {"result": f"No saved station matches '{query}' and the station directories found nothing for it{where} (or are unreachable). "
+                              f"Suggest the user try the station's frequency or call sign, or add it by stream URL in the Radio tab.{_available_stations_hint()}"}
+        top = await _prepare_station_for_saving(results[0], client=client)
+    # The relay only serves saved stations, and a station you asked for by
+    # name is one you'll want again: save it (the user can remove it later).
+    station, created = radio_manager.add_station(top, source="directory")
+    station = station or top
+    conn.directory_stations[station["id"]] = station
+    await _send_play_radio(conn, station, "saved")
+    if created:
+        await _notify_sources_changed(conn, "radio", "created", station, f"Saved {_station_label(station)} from the directory")
+    others = "; ".join(_station_label(r) for r in results[1:4])
+    unverified = "" if top.get("online", True) else " The directory could not verify this stream recently (often just geo-blocking), so it may not play everywhere."
+    if top.get("provider") == "tunein":
+        unverified += " (Found via TuneIn.)"
+    print(f"[Tool] Radio: tuned in to directory station '{station['name']}' for '{query}'")
+    return {"result": f"No saved station matched, so I searched the online directory and tuned in to {_station_label(station)}; "
+                      f"it has been saved to the user's stations (they can say 'remove the {station['name']} station' to undo).{unverified}"
+                      + (f" Other matches: {others}." if others else "") + f" {conn.playback_summary()}"}
+
+
+async def _tool_list_radio_stations(conn: ClientConn, fc) -> dict:
+    stations = radio_manager.load_stations()
+    if not stations:
+        hint = " Say 'play some jazz radio' to search the online directory." if ONLINE_DIRECTORIES else " Stations can be added in the Radio tab."
+        return {"result": "No radio stations are saved yet." + hint}
+    src = conn.current_source()
+    playing_id = src.get("id") if src and src.get("type") == "radio" else None
+    items = []
+    for st in stations[:15]:
+        label = _station_label(st)
+        if st.get("id") == playing_id:
+            label += " [playing now]"
+        items.append(label)
+    more = f" …and {len(stations) - 15} more." if len(stations) > 15 else ""
+    starters = sum(1 for st in stations if st.get("source") == "default")
+    note = ""
+    if starters:
+        note = (f" {starters} of these are starter picks pre-loaded on first run; the user can remove any and add more"
+                + (" by saying e.g. 'save a jazz station' or via the Radio tab's Find Stations." if ONLINE_DIRECTORIES else " via the Radio tab (stream URL)."))
+    return {"result": f"{len(stations)} saved radio station{'s' if len(stations) != 1 else ''}: {'; '.join(items)}.{more}{note}"}
+
+
+async def _tool_save_radio_station(conn: ClientConn, fc) -> dict:
+    args = fc.args or {}
+    query = str(args.get("query") or "").strip()
+    custom_name = _clean_new_name(str(args.get("name") or ""))
+
+    if not query or _is_current_ref(query, _RADIO_REF_FILLER):
+        src = conn.current_source()
+        if not src or src.get("type") != "radio":
+            return {"result": "No radio station is playing right now, so there is nothing to save. Ask which station (name or genre) to find and save."}
+        existing = radio_manager.get_station_by_id(src["id"])
+        if existing:
+            if custom_name and custom_name != existing["name"]:
+                updated = radio_manager.update_station(existing["id"], name=custom_name) or existing
+                msg = f"Renamed saved station '{existing['name']}' to '{updated['name']}'."
+                await _notify_sources_changed(conn, "radio", "updated", updated, msg)
+                return {"result": msg}
+            return {"result": f"{_station_label(existing)} is already in the saved stations."}
+        record = dict(conn.directory_stations.get(src["id"]) or {
+            "name": src.get("name"), "streamUrl": src.get("streamUrl"), "genre": src.get("genre", ""),
+        })
+        if custom_name:
+            record["name"] = custom_name
+        station, created = radio_manager.add_station(record, source="directory")
+        if not station:
+            return {"result": "I could not save the current station: its stream address is unknown. Ask the user to add it from the Radio tab."}
+        msg = f"Saved {_station_label(station)} to your radio stations."
+        await _notify_sources_changed(conn, "radio", "created" if created else "updated", station, msg)
+        conn.playback["source"]["saved"] = True
+        print(f"[Tool] {msg}")
+        return {"result": msg + " It keeps playing."}
+
+    existing = radio_manager.find_station(query)
+    if existing and not custom_name:
+        return {"result": f"{_station_label(existing)} is already saved. Say 'play {existing['name']}' to tune in."}
+    if not ONLINE_DIRECTORIES:
+        return {"result": "The online station directory is disabled, so stations can only be added with their stream URL in the Radio tab."}
+    async with _http_client(timeout=8.0) as client:
+        results = await _search_stations(query, limit=5, client=client)
+        if not results:
+            return {"result": f"The station directories found nothing for '{query}' (or are unreachable). Nothing was saved."}
+        top = await _prepare_station_for_saving(results[0], client=client)
+    if custom_name:
+        top["name"] = custom_name
+    station, created = radio_manager.add_station(top, source="directory")
+    msg = f"Saved {_station_label(station)} to your radio stations." if created else f"{_station_label(station)} was already saved; details refreshed."
+    await _notify_sources_changed(conn, "radio", "created" if created else "updated", station, msg)
+    print(f"[Tool] {msg}")
+    return {"result": msg + f" Playback was not changed; say 'play {station['name']}' to tune in."}
+
+
+async def _tool_remove_radio_station(conn: ClientConn, fc) -> dict:
+    args = fc.args or {}
+    name = str(args.get("name") or "").strip()
+    src = conn.current_source()
+    if _is_current_ref(name, _RADIO_REF_FILLER):
+        if not src or src.get("type") != "radio":
+            return {"result": "No radio station is playing right now, so 'this station' is ambiguous." + _available_stations_hint()}
+        station = radio_manager.get_station_by_id(src["id"])
+        if not station:
+            return {"result": f"The playing station '{src.get('name')}' is not in the saved list (it came from the directory), so there is nothing to remove."}
+    else:
+        station = radio_manager.find_station(name)
+        if not station:
+            return {"result": f"No saved station matches '{name}'." + _available_stations_hint()}
+    if not radio_manager.delete_station(station["id"]):
+        return {"result": f"Could not remove station '{station['name']}'."}
+    msg = f"Removed {_station_label(station)} from your saved stations."
+    if src and src.get("type") == "radio" and src.get("id") == station["id"]:
+        msg += " It keeps playing until you change the station or play music."
+        conn.playback["source"]["saved"] = False
+    await _notify_sources_changed(conn, "radio", "deleted", station, msg)
+    print(f"[Tool] {msg}")
+    return {"result": msg}
+
+
+def _resolve_podcast(conn: ClientConn, spoken: str) -> tuple[dict | None, str | None]:
+    spoken = (spoken or "").strip()
+    src = conn.current_source()
+    if _is_current_ref(spoken, _PODCAST_REF_FILLER):
+        if src and src.get("type") == "podcast":
+            pod = podcast_manager.get_podcast_by_id(src["id"])
+            if pod:
+                return pod, None
+            return None, "The podcast that was playing is no longer subscribed." + _available_podcasts_hint()
+        pods = podcast_manager.load_podcasts()
+        if len(pods) == 1 and not spoken:
+            return pods[0], None
+        return None, "No podcast is playing right now, so I need to know which podcast you mean." + _available_podcasts_hint()
+    pod = podcast_manager.find_podcast(spoken)
+    if not pod:
+        return None, f"No subscribed podcast matches '{spoken}'." + _available_podcasts_hint() + (
+            " Offer to subscribe to it (subscribeToPodcast) if they want." if ONLINE_DIRECTORIES else "")
+    return pod, None
+
+
+async def _refresh_if_stale(pod: dict) -> tuple[dict, str | None]:
+    if not podcast_manager.is_stale(pod):
+        return pod, None
+    async with _http_client(timeout=15.0) as client:
+        fresh, err = await podcast_manager.refresh_podcast(pod["id"], client=client)
+    return (fresh or pod), err
+
+
+async def _tool_play_podcast(conn: ClientConn, fc) -> dict:
+    args = fc.args or {}
+    pod, err = _resolve_podcast(conn, str(args.get("podcast") or ""))
+    if err:
+        return {"result": err}
+    pod, refresh_err = await _refresh_if_stale(pod)
+    if not pod.get("episodes") and refresh_err:
+        return {"result": f"Could not load episodes for '{pod['title']}': {refresh_err} The feed may be offline; ask the user to try again later or check the feed in the Podcasts tab."}
+
+    src = conn.current_source()
+    current_ep = src.get("episodeId") if src and src.get("type") == "podcast" and src.get("id") == pod["id"] else None
+    ep, err = podcast_manager.resolve_episode(pod, str(args.get("episode") or ""), current_episode_id=current_ep)
+    if err:
+        return {"result": err}
+
+    await conn.send_json({"type": "command", "action": "playPodcastEpisode", "podcast": _podcast_summary(pod), "episode": ep})
+    conn.playback.update({
+        "playing": True, "track_id": None,
+        "source": {"type": "podcast", "id": pod["id"], "name": pod["title"], "episodeId": ep["id"],
+                   "episodeTitle": ep["title"], "duration": ep.get("duration"), "episodeDescription": ep.get("description", "")},
+    })
+    podcast_manager.mark_played(pod["id"])
+    print(f"[Tool] Podcast: playing '{ep['title']}' from '{pod['title']}'")
+    notes = f" Episode notes: {ep['description'][:200]}" if ep.get("description") else ""
+    warn = f" (The feed could not be refreshed — {refresh_err} — so this is from the cached episode list.)" if refresh_err else ""
+    return {"result": f"Playing {podcast_manager.episode_label(ep)} from '{pod['title']}'. It resumes where the user left off if they started it before.{notes}{warn} {conn.playback_summary()}"}
+
+
+async def _tool_list_podcasts(conn: ClientConn, fc) -> dict:
+    pods = podcast_manager.load_podcasts()
+    if not pods:
+        hint = " Say 'subscribe to <podcast name>' to add one." if ONLINE_DIRECTORIES else " Subscriptions can be added with a feed URL in the Podcasts tab."
+        return {"result": "There are no podcast subscriptions yet." + hint}
+    items = []
+    for p in pods[:12]:
+        eps = p.get("episodes") or []
+        latest = f", latest: '{eps[0]['title']}'" if eps else (", episodes not loaded yet" if not p.get("lastFetchedAt") else "")
+        items.append(f"'{p['title']}'{' by ' + p['author'] if p.get('author') else ''} ({len(eps)} episodes{latest})")
+    more = f" …and {len(pods) - 12} more." if len(pods) > 12 else ""
+    starters = sum(1 for p in pods if p.get("source") == "default")
+    note = ""
+    if starters:
+        note = (f" {starters} of these are starter picks pre-loaded on first run; the user can unsubscribe from any and add more"
+                + (" by saying e.g. 'subscribe to <podcast name>' or via the Podcasts tab." if ONLINE_DIRECTORIES else " via the Podcasts tab (feed URL)."))
+    return {"result": f"{len(pods)} podcast subscription{'s' if len(pods) != 1 else ''}: {'; '.join(items)}.{more}{note}"}
+
+
+async def _tool_describe_podcast(conn: ClientConn, fc) -> dict:
+    args = fc.args or {}
+    pod, err = _resolve_podcast(conn, str(args.get("podcast") or ""))
+    if err:
+        return {"result": err}
+    pod, refresh_err = await _refresh_if_stale(pod)
+    eps = pod.get("episodes") or []
+    if not eps:
+        return {"result": f"'{pod['title']}' has no episodes in its feed" + (f" (refresh failed: {refresh_err})" if refresh_err else "") + "."}
+    listing = "; ".join(f"{i + 1}. {podcast_manager.episode_label(e)}" for i, e in enumerate(eps[:8]))
+    more = f"; …and {len(eps) - 8} older" if len(eps) > 8 else ""
+    about = f" About: {pod['description'][:200]}" if pod.get("description") else ""
+    latest_notes = f" The latest episode is about: {eps[0]['description'][:200]}" if eps[0].get("description") else ""
+    return {"result": f"'{pod['title']}'{' by ' + pod['author'] if pod.get('author') else ''} has {len(eps)} episodes, newest first: {listing}{more}.{about}{latest_notes} This listing is authoritative."}
+
+
+async def _tool_subscribe_to_podcast(conn: ClientConn, fc) -> dict:
+    args = fc.args or {}
+    query = str(args.get("query") or "").strip()
+    if not query:
+        return {"result": "I need the podcast's name (or feed URL) to subscribe. Ask the user which podcast."}
+
+    others = ""
+    if re.match(r"^https?://", query, re.IGNORECASE):
+        feed_url = query
+    else:
+        already = podcast_manager.find_podcast(query)
+        if already:
+            return {"result": f"Already subscribed to '{already['title']}'. Say 'play {already['title']}' to listen."}
+        if not ONLINE_DIRECTORIES:
+            return {"result": "The online podcast directory is disabled; podcasts can be added with their RSS feed URL in the Podcasts tab."}
+        async with _http_client(timeout=8.0) as client:
+            results = await podcast_manager.search_directory(query, limit=5, client=client)
+        if not results:
+            return {"result": f"The podcast directory found nothing for '{query}' (or is unreachable). Nothing was added."}
+        feed_url = results[0]["feedUrl"]
+        others = "; ".join(f"'{r['title']}' by {r['author']}" for r in results[1:4])
+
+    try:
+        async with _http_client(timeout=15.0) as client:
+            parsed = await podcast_manager.fetch_feed(feed_url, client=client)
+    except ValueError as e:
+        return {"result": f"Found the podcast but could not load its feed: {e} Nothing was added."}
+
+    pod, created = podcast_manager.upsert_podcast(parsed)
+    eps = pod.get("episodes") or []
+    latest = f" Latest episode: {podcast_manager.episode_label(eps[0])}." if eps else ""
+    msg = (f"Subscribed to '{pod['title']}'" if created else f"Refreshed existing subscription '{pod['title']}'") + \
+          (f" by {pod['author']}" if pod.get("author") else "") + f" ({len(eps)} episodes)."
+    await _notify_sources_changed(conn, "podcast", "created" if created else "updated", pod, msg)
+    print(f"[Tool] {msg}")
+    return {"result": msg + latest + " Playback was not changed." + (f" Other directory matches were: {others}." if others else "")}
+
+
+async def _tool_unsubscribe_from_podcast(conn: ClientConn, fc) -> dict:
+    args = fc.args or {}
+    pod, err = _resolve_podcast(conn, str(args.get("podcast") or ""))
+    if err:
+        return {"result": err}
+    if not podcast_manager.delete_podcast(pod["id"]):
+        return {"result": f"Could not remove '{pod['title']}'."}
+    msg = f"Unsubscribed from '{pod['title']}'."
+    src = conn.current_source()
+    if src and src.get("type") == "podcast" and src.get("id") == pod["id"]:
+        msg += " The current episode keeps playing."
+    await _notify_sources_changed(conn, "podcast", "deleted", pod, msg)
+    print(f"[Tool] {msg}")
+    return {"result": msg}
+
+
+def _latest_items_hint(items: list[dict]) -> str:
+    return "; ".join(f"{podcast_manager.episode_label(i['episode'])} from '{i['podcast']['title']}'" for i in items)
+
+
+async def _tool_list_latest_episodes(conn: ClientConn, fc) -> dict:
+    args = fc.args or {}
+    try:
+        count = int(args.get("count") or 8)
+    except (TypeError, ValueError):
+        count = 8
+    count = max(1, min(count, 25))
+    items = podcast_manager.latest_episodes(limit=count)
+    if not items:
+        pods = podcast_manager.load_podcasts()
+        return {"result": ("There are no podcast subscriptions yet." if not pods else
+                           "No episodes are loaded yet for your podcasts; they load when a show is opened or played.")}
+    listing = "; ".join(f"{i + 1}. {podcast_manager.episode_label(it['episode'])} from '{it['podcast']['title']}'" for i, it in enumerate(items))
+    return {"result": f"The {len(items)} newest episodes across your podcasts, newest first: {listing}. Say 'play the newest episodes' to start them. This listing is authoritative."}
+
+
+async def _tool_play_latest_episodes(conn: ClientConn, fc) -> dict:
+    args = fc.args or {}
+    try:
+        count = int(args.get("count") or 5)
+    except (TypeError, ValueError):
+        count = 5
+    count = max(1, min(count, 25))
+    queue_only = bool(args.get("queueOnly", False))
+    items = podcast_manager.latest_episodes(limit=count)
+    if not items:
+        return {"result": "No podcast episodes are available to play yet (no subscriptions, or their feeds have not loaded)."}
+    first, rest = items[0], items[1:]
+    if queue_only:
+        await conn.send_json({"type": "command", "action": "queuePodcastEpisodes", "items": items})
+        q = conn.playback.get("queue") or []
+        q.extend({"id": it["episode"]["id"], "title": it["episode"]["title"], "artist": it["podcast"]["title"], "kind": "podcast"} for it in items)
+        conn.playback["queue"] = q
+        print(f"[Tool] Podcasts: cued {len(items)} newest episodes")
+        return {"result": f"Cued {len(items)} newest episodes: {_latest_items_hint(items)}. Playback was not interrupted. {conn.playback_summary()}"}
+    await conn.send_json({"type": "command", "action": "playPodcastEpisode", "podcast": first["podcast"], "episode": first["episode"]})
+    if rest:
+        await conn.send_json({"type": "command", "action": "queuePodcastEpisodes", "items": rest})
+    conn.playback.update({
+        "playing": True, "track_id": None,
+        "source": {"type": "podcast", "id": first["podcast"]["id"], "name": first["podcast"]["title"], "episodeId": first["episode"]["id"],
+                   "episodeTitle": first["episode"]["title"], "duration": first["episode"].get("duration"), "episodeDescription": first["episode"].get("description", "")},
+        "queue": [{"id": it["episode"]["id"], "title": it["episode"]["title"], "artist": it["podcast"]["title"], "kind": "podcast"} for it in rest],
+    })
+    podcast_manager.mark_played(first["podcast"]["id"])
+    print(f"[Tool] Podcasts: playing newest episode '{first['episode']['title']}' + {len(rest)} cued")
+    more = f" Cued after it: {_latest_items_hint(rest)}." if rest else ""
+    return {"result": f"Playing the newest episode: {podcast_manager.episode_label(first['episode'])} from '{first['podcast']['title']}'.{more} {conn.playback_summary()}"}
+
+
+async def _tool_seek_relative(conn: ClientConn, fc) -> dict:
+    args = fc.args or {}
+    try:
+        seconds = float(args.get("seconds") or 0)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if seconds == 0:
+        return {"result": "Tell me how far to skip, e.g. 30 seconds ahead or a minute back."}
+    seconds = max(-3600.0, min(3600.0, seconds))
+    src = conn.current_source()
+    if src and src.get("type") not in SEEKABLE_SOURCE_TYPES:
+        return {"result": "Live radio cannot be skipped forward or back."}
+    if not src and not conn.now_playing():
+        return {"result": "Nothing is playing right now, so there is nothing to skip within."}
+
+    await conn.send_json({"type": "command", "action": "seekRelative", "seconds": seconds})
+    where = ""
+    if src and isinstance(src.get("position"), (int, float)):
+        new_pos = max(0.0, float(src["position"]) + seconds)
+        if isinstance(src.get("duration"), (int, float)) and src["duration"] > 0:
+            new_pos = min(new_pos, float(src["duration"]))
+        src["position"] = new_pos
+        where = f" Now at {_fmt_clock(new_pos)}" + (f" of {_fmt_clock(src['duration'])}" if src.get("duration") else "") + "."
+    amount = _fmt_clock(abs(seconds)) if abs(seconds) >= 60 else f"{int(abs(seconds))} seconds"
+    return {"result": f"Skipped {'ahead' if seconds > 0 else 'back'} {amount}.{where}"}
+
+
+SPEED_STEPS = [0.8, 1.0, 1.25, 1.5, 1.75, 2.0]
+
+
+async def _tool_set_volume(conn: ClientConn, fc) -> dict:
+    args = fc.args or {}
+    current = float(conn.playback.get("volume") if conn.playback.get("volume") is not None else 1.0)
+
+    def _num(v):
+        try:
+            return None if v is None or v == "" else float(v)
+        except (TypeError, ValueError):
+            return None
+
+    level, change = _num(args.get("level")), _num(args.get("change"))
+    if level is not None:
+        target = level / 100.0 if level > 1.0 else level          # accept 40 or 0.4
+    elif change is not None:
+        target = current + change / 100.0
+    else:
+        target = current + 0.15
+    target = max(0.0, min(1.0, target))
+    await conn.send_json({"type": "command", "action": "setVolume", "level": round(target, 3)})
+    conn.playback["volume"] = target
+    pct = round(target * 100)
+    print(f"[Tool] Volume -> {pct}% (was {round(current * 100)}%)")
+    if pct == 0:
+        return {"result": "Muted the music (volume 0%). The DJ voice is unaffected."}
+    direction = "up" if target > current + 0.001 else ("down" if target < current - 0.001 else "unchanged")
+    return {"result": f"Volume {direction}: now {pct}% (was {round(current * 100)}%)."}
+
+
+async def _tool_set_playback_speed(conn: ClientConn, fc) -> dict:
+    args = fc.args or {}
+    src = conn.current_source()
+    if src and src.get("type") == "radio":
+        return {"result": "Live radio always plays at normal speed; playback speed applies to podcasts and audiobooks."}
+    if src and src.get("type") == "stream":
+        return {"result": "Streamed tracks play at normal speed; playback speed applies to podcasts and audiobooks. Nothing was changed."}
+    if not (src and src.get("type") in SEEKABLE_SOURCE_TYPES):
+        return {"result": "Playback speed only applies to podcast episodes and audiobook chapters; music always plays at normal speed. Nothing was changed."}
+    current = float(conn.playback.get("playbackRate") or 1.0)
+    raw = args.get("rate")
+    if raw is None or raw == "":
+        faster = [x for x in SPEED_STEPS if x > current + 0.01]
+        rate = faster[0] if faster else SPEED_STEPS[-1]
+    else:
+        try:
+            rate = float(raw)
+        except (TypeError, ValueError):
+            return {"result": "I did not catch the speed. Say e.g. '1.5x', 'double speed' (2) or 'normal speed' (1)."}
+    rate = max(0.5, min(3.0, rate))
+    await conn.send_json({"type": "command", "action": "setPlaybackRate", "rate": rate})
+    conn.playback["playbackRate"] = rate
+    label = f"{rate:g}x"
+    what = src.get("episodeTitle") if src["type"] == "podcast" else (src.get("chapterTitle") or src.get("name"))
+    if abs(rate - 1.0) < 0.01:
+        return {"result": f"Back to normal speed (1x) for '{what}'."}
+    return {"result": f"Playing '{what}' at {label}."}
+
+
+# ── Audiobook voice tools ─────────────────────────────────────────────────────
+
+_BOOK_REF_FILLER = {"the", "a", "my", "book", "audiobook", "audio", "novel", "story", "one", "again", "it", "reading", "listening"}
+
+
+def _audiobooks_unavailable() -> str | None:
+    if AUDIOBOOKS_DIR is None:
+        return "Audiobooks are not set up: there is no AUDIOBOOKS_DIR in backend/.env. Tell the user to add the path to their audiobook folder there and restart the server."
+    if not audiobooks_scan_complete:
+        return "The audiobook folder is still being scanned. Ask the user to try again shortly."
+    if not audiobook_library:
+        return f"The audiobook folder ({AUDIOBOOKS_DIR}) contains no audiobooks. Books are folders of chapter files or single .m4b/.mp3 files."
+    return None
+
+
+def _available_books_hint(limit: int = 6) -> str:
+    names = [f"'{b['title']}'" for b in audiobook_library[:limit]]
+    return f" Audiobooks: {', '.join(names)}." if names else ""
+
+
+def _resolve_audiobook(conn: ClientConn, spoken: str) -> tuple[dict | None, str | None]:
+    """'current' / '' -> the book playing now, else the most recently listened
+    one; anything else is fuzzy-matched on title/author/narrator."""
+    spoken = (spoken or "").strip()
+    progress = audiobook_manager.load_progress()
+    src = conn.current_source()
+    if _is_current_ref(spoken, _BOOK_REF_FILLER):
+        if src and src.get("type") == "audiobook":
+            book = audiobooks_by_id.get(src.get("id") or "")
+            if book:
+                return book, None
+        recent = audiobook_manager.most_recent_book(audiobook_library, progress)
+        if recent:
+            return recent, None
+        if len(audiobook_library) == 1:
+            return audiobook_library[0], None
+        return None, "No audiobook is playing or in progress, so I need to know which book." + _available_books_hint()
+    book = audiobook_manager.find_audiobook(spoken, audiobook_library, progress)
+    if not book:
+        return None, f"No audiobook matches '{spoken}'." + _available_books_hint()
+    return book, None
+
+
+async def _tool_play_audiobook(conn: ClientConn, fc) -> dict:
+    args = fc.args or {}
+    unavailable = _audiobooks_unavailable()
+    if unavailable:
+        return {"result": unavailable}
+    book, err = _resolve_audiobook(conn, str(args.get("book") or ""))
+    if err:
+        return {"result": err}
+    prog = audiobook_manager.get_progress(book["id"])
+    src = conn.current_source()
+    current_ch = src.get("chapterId") if src and src.get("type") == "audiobook" and src.get("id") == book["id"] else None
+    ch, position, err = audiobook_manager.resolve_chapter(book, str(args.get("chapter") or ""), progress=prog, current_chapter_id=current_ch)
+    if err:
+        return {"result": err}
+
+    await conn.send_json({
+        "type": "command", "action": "playAudiobookChapter",
+        "book": audiobook_manager.summarize(book, prog), "chapter": ch, "position": position,
+        "chapterCount": len(book.get("chapters") or []),
+    })
+    conn.playback.update({
+        "playing": True, "track_id": None,
+        "source": {"type": "audiobook", "id": book["id"], "name": book["title"], "author": book.get("author", ""),
+                   "chapterId": ch["id"], "chapterIndex": ch["index"], "chapterTitle": ch["title"],
+                   "chapterCount": len(book.get("chapters") or []), "position": position, "duration": ch.get("duration")},
+    })
+    resumed = position > 0
+    where = f", resuming at {_fmt_clock(position)}" if resumed else ""
+    print(f"[Tool] Audiobook: playing {audiobook_manager.chapter_label(book, ch)} of '{book['title']}'{where}")
+    status = audiobook_manager.progress_label(book, prog)
+    return {"result": f"Playing {audiobook_manager.book_label(book)}, {audiobook_manager.chapter_label(book, ch)}{where}. "
+                      f"Before this the book was {status}. Progress is remembered automatically. {conn.playback_summary()}"}
+
+
+async def _tool_list_audiobooks(conn: ClientConn, fc) -> dict:
+    unavailable = _audiobooks_unavailable()
+    if unavailable:
+        return {"result": unavailable}
+    progress = audiobook_manager.load_progress()
+    src = conn.current_source()
+    playing_id = src.get("id") if src and src.get("type") == "audiobook" else None
+    items = []
+    for b in audiobook_library[:15]:
+        label = audiobook_manager.book_label(b)
+        label += f" [{audiobook_manager.format_duration(b.get('duration'))}, {b.get('chapterCount')} chapter{'s' if b.get('chapterCount') != 1 else ''}]"
+        label += f" — {audiobook_manager.progress_label(b, progress.get(b['id']))}"
+        if b["id"] == playing_id:
+            label += " [playing now]"
+        items.append(label)
+    more = f" …and {len(audiobook_library) - 15} more." if len(audiobook_library) > 15 else ""
+    in_progress = [b for b in audiobook_library if progress.get(b["id"]) and not progress[b["id"]].get("finished")]
+    note = f" {len(in_progress)} in progress." if in_progress else ""
+    return {"result": f"{len(audiobook_library)} audiobook{'s' if len(audiobook_library) != 1 else ''}: {'; '.join(items)}.{more}{note}"}
+
+
+async def _tool_describe_audiobook(conn: ClientConn, fc) -> dict:
+    args = fc.args or {}
+    unavailable = _audiobooks_unavailable()
+    if unavailable:
+        return {"result": unavailable}
+    book, err = _resolve_audiobook(conn, str(args.get("book") or ""))
+    if err:
+        return {"result": err}
+    prog = audiobook_manager.get_progress(book["id"])
+    chapters = book.get("chapters") or []
+    listing = "; ".join(audiobook_manager.chapter_label(book, c) for c in chapters[:12])
+    more = f"; …and {len(chapters) - 12} more" if len(chapters) > 12 else ""
+    return {"result": f"{audiobook_manager.book_label(book)}: {audiobook_manager.format_duration(book.get('duration'))} in {len(chapters)} chapter{'s' if len(chapters) != 1 else ''}"
+                      f"{', genre ' + book['genre'] if book.get('genre') and book['genre'] != 'Audiobook' else ''}. "
+                      f"Progress: {audiobook_manager.progress_label(book, prog)}. Chapters: {listing}{more}. This listing is authoritative."}
+
+
+# ── Streaming voice tools ─────────────────────────────────────────────────────
+
+def _stream_kind(raw: str, query: str) -> str:
+    kind = (raw or "").strip().lower()
+    if kind in {"track", "song", "tracks", "songs"}:
+        return "track"
+    if kind in {"album", "albums", "record"}:
+        return "album"
+    if kind in {"artist", "artists", "band"}:
+        return "artist"
+    if re.search(r"\b(album|record|lp)\b", query, re.IGNORECASE):
+        return "album"
+    return "track"
+
+
+_PROVIDER_ALIASES = {
+    "apple": "apple", "apple music": "apple", "itunes": "apple",
+    "deezer": "deezer",
+    "youtube": "ytmusic", "youtube music": "ytmusic", "yt music": "ytmusic", "yt": "ytmusic", "ytmusic": "ytmusic",
+}
+
+
+def _stream_provider(raw: str, query: str) -> str | None:
+    """A provider the user named (argument or inside the query), else None = any."""
+    for text in (raw or "", query or ""):
+        t = text.lower()
+        for alias, pid in sorted(_PROVIDER_ALIASES.items(), key=lambda kv: -len(kv[0])):
+            if re.search(rf"\b{re.escape(alias)}\b", t):
+                return pid
+    return None
+
+
+def _clean_stream_query(query: str) -> str:
+    q = re.sub(r"\b(on|from|in|via|with|using)\s+(apple\s+music|apple|itunes|deezer|youtube\s+music|yt\s+music|youtube|yt)\b", " ", query, flags=re.IGNORECASE)
+    q = re.sub(r"\b(apple\s+music|deezer|youtube\s+music|yt\s+music|streaming|stream|online)\b", " ", q, flags=re.IGNORECASE)
+    q = re.sub(r"\b(please|play|queue|cue|up|the\s+(?:song|track|album|artist)|song|track)\b", " ", q, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", q).strip() or query.strip()
+
+
+def _stream_track_duration(t: dict) -> int | None:
+    if t.get("full"):
+        return round((t.get("durationMs") or 0) / 1000) or None
+    return streaming_manager.PREVIEW_SECONDS if t.get("audioUrl") else None
+
+
+async def _send_play_stream(conn: ClientConn, tracks: list[dict], context: dict | None, queue_only: bool = False):
+    """Push the tracks to the browser and mirror the new source/queue locally
+    so the same-turn playback summary is already right."""
+    if queue_only:
+        await conn.send_json({"type": "command", "action": "queueStreamTracks", "tracks": tracks, "context": context})
+        q = conn.playback.get("queue") or []
+        for t in tracks:
+            q.append({"id": t["id"], "title": t["title"], "artist": t["artist"], "kind": "stream"})
+        conn.playback["queue"] = q
+        return
+    await conn.send_json({"type": "command", "action": "playStreamTracks", "tracks": tracks, "context": context})
+    first = tracks[0]
+    conn.playback.update({
+        "playing": True, "track_id": None,
+        "source": {"type": "stream", "id": first["id"], "title": first["title"], "artist": first["artist"], "album": first.get("album", ""),
+                   "provider": first.get("provider"), "full": bool(first.get("full")), "duration": _stream_track_duration(first),
+                   "contextType": (context or {}).get("type"), "contextName": (context or {}).get("name")},
+        "queue": [{"id": t["id"], "title": t["title"], "artist": t["artist"], "kind": "stream"} for t in tracks[1:]],
+    })
+
+
+def _pick_provider_results(results: list[dict], preferred: str | None) -> tuple[dict | None, str]:
+    """The first provider with playable TRACKS (preferred one first); also
+    the combined error text when none has any."""
+    order = ([r for r in results if r["provider"] == preferred] if preferred else []) + [r for r in results if r["provider"] != preferred]
+    for r in order:
+        r["tracks"] = [t for t in r["tracks"] if streaming_manager.playable(t)]
+        if r["tracks"]:
+            return r, ""
+    errors = "; ".join(f"{streaming_manager.provider_name(r['provider'])}: {r['error']}" for r in results if r.get("error"))
+    return None, errors
+
+
+async def _stream_collect(query: str, kind: str, provider: str | None, client: httpx.AsyncClient) -> tuple[list[dict], dict | None, str]:
+    """Spoken request -> (tracks, context, error)."""
+    q = _clean_stream_query(query)
+    providers = [provider] if provider else None
+    if kind == "track":
+        results = await streaming_manager.search_all(q, client, limit=5, providers=providers)
+        best, errors = _pick_provider_results(results, provider)
+        if not best or not best["tracks"]:
+            return [], None, f"No streaming source has a playable match for '{q}'." + (f" ({errors})" if errors else "")
+        return best["tracks"][:1], {"type": "search", "name": q, "provider": best["provider"]}, ""
+    if kind == "album":
+        q2 = re.sub(r"\b(the\s+)?album\b", " ", q, flags=re.IGNORECASE).strip() or q
+        results = await streaming_manager.search_all(q2, client, limit=3, providers=providers)
+        for r in ([x for x in results if x["provider"] == provider] if provider else []) + [x for x in results if x["provider"] != provider]:
+            if r["albums"]:
+                album = r["albums"][0]
+                songs = [t for t in await streaming_manager.album_tracks(album["id"], client) if streaming_manager.playable(t)]
+                if songs:
+                    return songs, {"type": "album", "name": album["name"], "id": album["id"], "artist": album.get("artist", ""), "provider": r["provider"]}, ""
+        return [], None, f"No album matching '{q2}' with playable tracks on the streaming sources."
+    results = await streaming_manager.search_all(q, client, limit=10, artist_only=True, providers=providers)
+    best, errors = _pick_provider_results(results, provider)
+    if not best or not best["tracks"]:
+        return [], None, f"No songs by '{q}' on the streaming sources." + (f" ({errors})" if errors else "")
+    return best["tracks"], {"type": "artist", "name": best["tracks"][0].get("artist") or q, "id": None, "provider": best["provider"]}, ""
+
+
+def _stream_reply(tracks: list[dict], context: dict | None) -> str:
+    first = tracks[0]
+    name = streaming_manager.provider_name(first.get("provider", ""))
+    ctx = ""
+    if context and context.get("type") in ("album", "artist"):
+        ctx = f" from {context['type']} '{context['name']}'" + (f" ({len(tracks)} tracks, the rest are cued)" if len(tracks) > 1 else " (its only playable track)")
+    return f"Streaming from {name}: {streaming_manager.track_label(first)}{ctx}. {streaming_manager.mode_note(first)}"
+
+
+async def _tool_play_stream(conn: ClientConn, fc) -> dict:
+    args = fc.args or {}
+    query = str(args.get("query") or "").strip()
+    if not query:
+        return {"result": "I need to know what to stream (a song, artist or album)."}
+    kind = _stream_kind(str(args.get("kind") or ""), query)
+    provider = _stream_provider(str(args.get("source") or ""), query)
+    if provider and not streaming_manager.provider_status(provider)["available"]:
+        return {"result": f"{streaming_manager.provider_name(provider)} is not available: {streaming_manager.provider_status(provider)['reason']}. "
+                          f"Available streaming sources: {', '.join(streaming_manager.provider_name(p) for p in streaming_manager.available_providers()) or 'none'}."}
+    async with _http_client(timeout=12.0) as client:
+        tracks, context, err = await _stream_collect(query, kind, provider, client)
+    if err:
+        return {"result": err + (" Suggest trying the local library (searchAndPlay) or a different spelling." if kind == "track" else "")}
+    await _send_play_stream(conn, tracks, context)
+    first = tracks[0]
+    print(f"[Tool] Streaming: playing {streaming_manager.track_label(first)} via {first.get('provider')}" + (f" ({context['type']} '{context['name']}')" if context else ""))
+    return {"result": f"{_stream_reply(tracks, context)} {conn.playback_summary()}"}
+
+
+async def _tool_queue_stream(conn: ClientConn, fc) -> dict:
+    args = fc.args or {}
+    query = str(args.get("query") or "").strip()
+    if not query:
+        return {"result": "I need to know which song to cue from the streaming sources."}
+    provider = _stream_provider(str(args.get("source") or ""), query)
+    async with _http_client(timeout=12.0) as client:
+        tracks, context, err = await _stream_collect(query, "track", provider, client)
+    if err or not tracks:
+        return {"result": err or f"Nothing was found for '{query}'."}
+    await _send_play_stream(conn, tracks[:1], context, queue_only=True)
+    t = tracks[0]
+    print(f"[Tool] Streaming: queued {streaming_manager.track_label(t)} via {t.get('provider')}")
+    return {"result": f"Cued up from {streaming_manager.provider_name(t.get('provider', ''))}: {streaming_manager.track_label(t)} to play after the current item. "
+                      f"{streaming_manager.mode_note(t)} {conn.playback_summary()}"}
 
 
 TOOL_HANDLERS = {
@@ -1641,6 +3544,27 @@ TOOL_HANDLERS = {
     "resumePlayback": _tool_resume,
     "nextTrack": _tool_next,
     "previousTrack": _tool_prev,
+    # live radio & podcasts
+    "playRadio": _tool_play_radio,
+    "listRadioStations": _tool_list_radio_stations,
+    "saveRadioStation": _tool_save_radio_station,
+    "removeRadioStation": _tool_remove_radio_station,
+    "playPodcast": _tool_play_podcast,
+    "listPodcasts": _tool_list_podcasts,
+    "describePodcast": _tool_describe_podcast,
+    "subscribeToPodcast": _tool_subscribe_to_podcast,
+    "unsubscribeFromPodcast": _tool_unsubscribe_from_podcast,
+    "listLatestEpisodes": _tool_list_latest_episodes,
+    "playLatestEpisodes": _tool_play_latest_episodes,
+    "seekRelative": _tool_seek_relative,
+    "setPlaybackSpeed": _tool_set_playback_speed,
+    "setVolume": _tool_set_volume,
+    # audiobooks & streaming
+    "playAudiobook": _tool_play_audiobook,
+    "listAudiobooks": _tool_list_audiobooks,
+    "describeAudiobook": _tool_describe_audiobook,
+    "playStream": _tool_play_stream,
+    "queueStream": _tool_queue_stream,
 }
 
 
@@ -1898,6 +3822,16 @@ async def ws_live_proxy(ws: WebSocket):
                     conn.playback["track_id"] = data.get("trackId")
                     conn.playback["queue"] = data.get("queue", [])
                     conn.playback["playlist"] = data.get("playlist")
+                    src = data.get("source")
+                    conn.playback["source"] = src if isinstance(src, dict) and src.get("type") in SOURCE_TYPES else None
+                    try:
+                        conn.playback["playbackRate"] = float(data.get("playbackRate") or 1.0)
+                    except (TypeError, ValueError):
+                        conn.playback["playbackRate"] = 1.0
+                    try:
+                        conn.playback["volume"] = max(0.0, min(1.0, float(data.get("volume")))) if data.get("volume") is not None else conn.playback.get("volume")
+                    except (TypeError, ValueError):
+                        pass
 
                 # Browser speech recognition can capture a complete request
                 # with “Hey DJ”, or a follow-up command during the short live

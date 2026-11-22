@@ -38,8 +38,13 @@ if %ERRORLEVEL% neq 0 (
 )
 
 REM -- Run --------------------------------------------------------------
-REM The tests never touch backend\.env, backend\playlists.json or your
-REM music folder: they use a dummy API key and a temporary playlist file.
+REM The tests never touch backend\.env, backend\playlists.json,
+REM backend\radio_stations.json, backend\podcasts.json, backend\audiobooks.json,
+REM your music folder or your audiobook folder:
+REM they use a dummy API key, temporary data files, a generated mini audiobook
+REM library and mocked network calls (directories, feeds, streaming providers).
+REM If Node.js is installed, the frontend unit tests (frontend\tests) run too;
+REM otherwise that single test is skipped.
 echo.
 echo [TEST] Running pytest...
 echo.

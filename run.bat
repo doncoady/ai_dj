@@ -45,6 +45,8 @@ if not exist "backend\.env" (
     echo         Create it with:
     echo           GEMINI_API_KEY=your_key_here
     echo           MUSIC_DIR=local_path_to_music_files
+    echo         Optional: AUDIOBOOKS_DIR=local_path_to_audiobooks
+    echo         See backend\.env.example for all settings.
     pause
     exit /b 1
 )

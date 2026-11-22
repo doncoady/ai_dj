@@ -58,34 +58,54 @@ body {
   }
 }
 
-/* Visualizer Canvas */
-/*#visualizer {
-  position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-  pointer-events: none; z-index: 0; opacity: 0.2; mix-blend-mode: screen;
-}*/
-#visualizer {
-  position: fixed;
-  inset: 0;
-  width: 100vw;
-  height: 100vh;
-  z-index: -1;
-}
-
 /* ── Layout ────────────────────────────────────────────────── */
-.container {
+/* Top bar (brand · DJ readout · Live toggle · volume) over a two-column
+   deck: NOW PLAYING on the left, BROWSE (one tab per source) on the right. */
+.app {
   position: relative;
   z-index: 1;
   width: 100%;
-  max-width: 1080px;
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 2rem;
-  padding: 2rem;
+  max-width: 1180px;
+  height: 100vh;
+  max-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 1.25rem;
 }
 
-@media (max-width: 768px) {
-  .container {
+.deck {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  /* Browse matches the player's width */
+  grid-template-columns: minmax(320px, 1fr) minmax(320px, 1fr);
+  gap: 1rem;
+}
+
+.deck > .glass {
+  min-height: 0;
+}
+
+.now-panel {
+  overflow-y: auto;
+}
+
+.browse-panel {
+  overflow: hidden;
+}
+
+@media (max-width: 900px) {
+  .app {
+    height: auto;
+    max-height: none;
+  }
+  .deck {
     grid-template-columns: 1fr;
+  }
+  body {
+    overflow: auto;
+    align-items: flex-start;
   }
 }
 
@@ -94,20 +114,192 @@ body {
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 1.5rem;
-  backdrop-filter: blur(24px);
-  padding: 2rem;
+  backdrop-filter: blur(14px);   /* 24px re-blurred every visualiser frame was the main source of lag */
+  padding: 1.5rem;
   display: flex;
   flex-direction: column;
   position: relative;
   overflow: hidden;
 }
 
-/* ── Header ────────────────────────────────────────────────── */
-.card-header {
+/* ── Top bar ───────────────────────────────────────────────── */
+.topbar {
+  flex-direction: row;
+  align-items: center;
+  gap: 1.25rem;
+  padding: 0.85rem 1.25rem;
+  border-radius: 1.25rem;
+  flex-shrink: 0;
+}
+
+.topbar .brand {
+  flex-shrink: 0;
+}
+
+.topbar-controls {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  margin-bottom: 2rem;
+  gap: 1rem;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+.volume-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.volume-control input[type="range"] {
+  width: 110px;
+}
+
+/* DJ status readout: glyph · state + connection pill · one-line detail · countdown */
+.dj-readout {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  flex: 1;
+  padding: 6px 14px;
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  transition: border-color 0.4s, background 0.4s;
+}
+
+.dj-readout.state-active {
+  border-color: rgba(66, 133, 244, 0.35);
+  background: rgba(66, 133, 244, 0.08);
+}
+
+.dj-readout-emoji {
+  font-size: 22px;
+  line-height: 1;
+  width: 28px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.dj-readout-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.dj-readout-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.dj-readout-name {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: -0.2px;
+  transition: color 0.3s;
+  white-space: nowrap;
+}
+
+.dj-readout-detail {
+  font-size: 11px;
+  opacity: 0.65;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dj-countdown-text {
+  font-size: 10px;
+  font-family: monospace;
+  color: rgba(255, 255, 255, 0.45);
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity 0.3s;
+  flex-shrink: 0;
+}
+
+.dj-countdown-text.visible {
+  opacity: 1;
+}
+
+/* Live mode switch */
+.live-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  height: 44px;
+  padding: 0 8px 0 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.05);
+  color: rgba(255, 255, 255, 0.75);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  user-select: none;
+  touch-action: manipulation;
+  transition: all 0.3s ease;
+}
+
+.live-toggle:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+
+.live-toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.live-toggle-icon {
+  font-size: 16px;
+}
+
+.live-toggle-track {
+  width: 40px;
+  height: 22px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  position: relative;
+  transition: background 0.3s;
+  flex-shrink: 0;
+}
+
+.live-toggle-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.3s ease;
+}
+
+.live-toggle.on {
+  border-color: transparent;
+  background: linear-gradient(135deg, #4285F4, #9B72CB, #D96570);
+  color: #fff;
+  box-shadow: 0 0 24px rgba(66, 133, 244, 0.35);
+  animation: glow 2s ease-in-out infinite alternate;
+}
+
+.live-toggle.on .live-toggle-track {
+  background: rgba(0, 0, 0, 0.3);
+}
+
+.live-toggle.on .live-toggle-knob {
+  transform: translateX(18px);
+}
+
+@keyframes glow {
+  from { box-shadow: 0 0 18px rgba(66, 133, 244, 0.3); }
+  to { box-shadow: 0 0 32px rgba(155, 114, 203, 0.5); }
 }
 
 .brand {
@@ -161,232 +353,10 @@ body {
   display: none;
 }
 
-/* ── Live Button ──────────────────────────────────────────── */
-.live-center {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  min-height: 300px;
-  gap: 1.5rem;
-}
-
-.live-btn {
-  width: 160px;
-  height: 160px;
-  border-radius: 50%;
-  border: 2px solid rgba(255, 255, 255, 0.1);
-  background: rgba(255, 255, 255, 0.05);
-  color: rgba(255, 255, 255, 0.5);
-  cursor: pointer;
-  font-size: 56px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.4s ease;
-}
-
-.live-btn:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.1);
-  color: #fff;
-}
-
-.live-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.live-btn-active {
-  background: linear-gradient(135deg, #4285F4, #9B72CB, #D96570) !important;
-  border-color: transparent !important;
-  color: #fff !important;
-  box-shadow: 0 0 40px rgba(66, 133, 244, 0.4), 0 0 80px rgba(155, 114, 203, 0.2);
-  animation: glow 2s ease-in-out infinite alternate;
-}
-
-@keyframes glow {
-  from {
-    box-shadow: 0 0 30px rgba(66, 133, 244, 0.3);
-  }
-
-  to {
-    box-shadow: 0 0 50px rgba(155, 114, 203, 0.5);
-  }
-}
-
-.live-btn-label {
-  font-size: 14px;
-  opacity: 0.7;
-  font-weight: 500;
-}
-
-/* ── AI State Display ─────────────────────────────────────── */
-#ai-state-panel {
-  width: 100%;
-  max-width: 320px;
-  background: rgba(0, 0, 0, 0.3);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  border-radius: 16px;
-  padding: 16px 20px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  transition: opacity 0.3s, border-color 0.4s;
-}
-
-#ai-state-panel.state-active {
-  border-color: rgba(66, 133, 244, 0.3);
-}
-
-.ai-state-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.ai-state-label {
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 2px;
-  font-weight: 600;
-  opacity: 0.5;
-  font-family: monospace;
-}
-
-#ai-state-icon {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.2);
-  transition: background 0.3s, box-shadow 0.3s;
-}
-
-#ai-state-icon.dot-offline {
-  background: rgba(255, 255, 255, 0.15);
-}
-
-#ai-state-icon.dot-connecting {
-  background: #FFC107;
-  box-shadow: 0 0 8px #FFC107;
-  animation: blink 1s infinite;
-}
-
-#ai-state-icon.dot-listening {
-  background: #4285F4;
-  box-shadow: 0 0 8px #4285F4;
-  animation: breathe 2s ease-in-out infinite;
-}
-
-#ai-state-icon.dot-processing {
-  background: #FF9800;
-  box-shadow: 0 0 8px #FF9800;
-  animation: blink 0.5s infinite;
-}
-
-#ai-state-icon.dot-speaking {
-  background: #00E676;
-  box-shadow: 0 0 12px #00E676;
-  animation: pulse-dot 0.6s ease-in-out infinite;
-}
-
-#ai-state-icon.dot-tool {
-  background: #E040FB;
-  box-shadow: 0 0 8px #E040FB;
-  animation: blink 0.3s infinite;
-}
-
-#ai-state-icon.dot-idle {
-  background: #78909C;
-  box-shadow: 0 0 6px #78909C;
-}
-
-#ai-state-icon.dot-error {
-  background: #F44336;
-  box-shadow: 0 0 8px #F44336;
-}
-
-#ai-state-icon.dot-disconnecting {
-  background: #FF5722;
-  animation: blink 0.8s infinite;
-}
-
-@keyframes blink {
-
-  0%,
-  100% {
-    opacity: 1;
-  }
-
-  50% {
-    opacity: 0.3;
-  }
-}
-
-@keyframes breathe {
-
-  0%,
-  100% {
-    transform: scale(1);
-    opacity: 0.8;
-  }
-
-  50% {
-    transform: scale(1.3);
-    opacity: 1;
-  }
-}
-
-@keyframes pulse-dot {
-
-  0%,
-  100% {
-    transform: scale(1);
-  }
-
-  50% {
-    transform: scale(1.5);
-  }
-}
-
-.ai-state-main {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-#ai-state-emoji {
-  font-size: 24px;
-  line-height: 1;
-  transition: transform 0.3s;
-}
-
-.ai-state-text {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-#ai-state-name {
-  font-size: 15px;
-  font-weight: 700;
-  letter-spacing: -0.3px;
-  transition: color 0.3s;
-}
-
-#ai-state-detail {
-  font-size: 11px;
-  opacity: 0.6;
-  font-weight: 400;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 220px;
-}
-
-/* Countdown bar */
+/* Countdown bar (auto-disconnect after a DJ turn) */
 .ai-countdown-wrap {
   height: 3px;
+  margin-top: 3px;
   background: rgba(255, 255, 255, 0.06);
   border-radius: 2px;
   overflow: hidden;
@@ -404,20 +374,6 @@ body {
   border-radius: 2px;
   background: linear-gradient(90deg, #4285F4, #9B72CB);
   transition: width 0.1s linear;
-}
-
-#ai-countdown-text {
-  font-size: 10px;
-  font-family: monospace;
-  text-align: right;
-  opacity: 0;
-  transition: opacity 0.3s;
-  color: rgba(255, 255, 255, 0.4);
-  height: 14px;
-}
-
-#ai-countdown-text.visible {
-  opacity: 1;
 }
 
 /* ── DJ Speaking ──────────────────────────────────────────── */
@@ -479,20 +435,6 @@ body {
 }
 
 /* ── Deck ─────────────────────────────────────────────────── */
-.deck-label {
-  font-size: 11px;
-  text-transform: uppercase;
-  opacity: 0.5;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-  padding-bottom: 1rem;
-  margin-bottom: 1rem;
-  font-weight: 600;
-  letter-spacing: 2px;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
 .now-playing {
   display: flex;
   align-items: center;
@@ -500,35 +442,60 @@ body {
   margin-bottom: 1rem;
 }
 
-.disc {
+.now-thumb-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+
+/* Fixed artwork tile: album art, station logo or podcast cover. No spinning
+   disc — it meant nothing for radio/podcasts; a small equalizer says "playing". */
+.now-thumb {
   width: 112px;
   height: 112px;
-  border-radius: 50%;
-  border: 2px solid rgba(255, 255, 255, 0.1);
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.04);
   display: flex;
   align-items: center;
   justify-content: center;
-  flex-shrink: 0;
-  font-size: 56px;
-  transition: border-color 0.5s;
+  font-size: 52px;
   background-size: cover;
   background-position: center;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  transition: box-shadow 0.4s, border-color 0.4s;
 }
 
-.disc.spinning {
-  border-color: transparent;
-  box-shadow: 0 0 0 2px #4285F4, 0 0 20px rgba(66, 133, 244, 0.3);
-  animation: spin 4s linear infinite;
+.now-thumb.playing {
+  border-color: rgba(66, 133, 244, 0.55);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35), 0 0 0 2px rgba(66, 133, 244, 0.35), 0 0 24px rgba(66, 133, 244, 0.25);
 }
 
-@keyframes spin {
-  from {
-    transform: rotate(0deg);
-  }
+.now-thumb-kind {
+  position: absolute;
+  top: -8px;
+  left: -8px;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: #1a1a24;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
 
-  to {
-    transform: rotate(360deg);
-  }
+.now-thumb-playing {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  height: 14px;
+  padding: 3px 5px;
+  border-radius: 5px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #00e676;
+  box-sizing: content-box;
 }
 
 .now-playing-label {
@@ -551,10 +518,16 @@ body {
   font-size: 18px;
   font-weight: 700;
   letter-spacing: -0.5px;
-  white-space: nowrap;
+  line-height: 1.25;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 280px;
+}
+
+.now-text {
+  min-width: 0;
+  flex: 1;
 }
 
 .now-playing-artist {
@@ -616,11 +589,12 @@ input[type=range]::-webkit-slider-thumb {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 2rem;
-  padding: 1.5rem 0;
+  flex-wrap: wrap;                 /* skip buttons + speed control wrap instead of squashing the round buttons */
+  gap: 8px 14px;
+  padding: 10px 0;
   border-top: 1px solid rgba(255, 255, 255, 0.1);
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-  margin-bottom: 1.5rem;
+  margin-bottom: 12px;
 }
 
 .transport-btn {
@@ -628,9 +602,14 @@ input[type=range]::-webkit-slider-thumb {
   border: none;
   color: rgba(255, 255, 255, 0.4);
   cursor: pointer;
-  padding: 12px;
+  /* Fixed square box (not glyph + padding) so every control is a true circle */
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  flex: 0 0 auto;
   border-radius: 50%;
-  font-size: 24px;
+  font-size: 18px;
+  line-height: 1;
   transition: all 0.2s;
   display: flex;
   align-items: center;
@@ -643,19 +622,20 @@ input[type=range]::-webkit-slider-thumb {
 }
 
 .play-btn {
-  width: 60px;
-  height: 60px;
-  border-radius: 30px;
-  background: linear-gradient(135deg, #4285F4, #9B72CB);
+  width: 44px;
+  height: 44px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #00c853, #00e676);
   border: none;
-  color: #fff;
+  color: #062d17;
   cursor: pointer;
-  font-size: 28px;
+  font-size: 20px;
   display: flex;
   align-items: center;
   justify-content: center;
   transition: transform 0.2s;
-  box-shadow: 0 0 20px rgba(66, 133, 244, 0.3);
+  box-shadow: 0 0 20px rgba(0, 230, 118, 0.3);
 }
 
 .play-btn:hover {
@@ -670,7 +650,7 @@ input[type=range]::-webkit-slider-thumb {
 }
 
 .track-list::-webkit-scrollbar {
-  width: 4px;
+  width: 10px;
 }
 
 .track-list::-webkit-scrollbar-track {
@@ -696,24 +676,34 @@ input[type=range]::-webkit-slider-thumb {
   background: rgba(255, 255, 255, 0.05);
 }
 
-.track-active {
-  background: rgba(255, 255, 255, 0.08);
+/* NOW PLAYING item — the same treatment whether it is a song row, an
+   episode row, a playlist card, a station card or a podcast card. */
+.track-active,
+.playlist-card.active-playlist,
+.source-card.active-source,
+.podcast-card.active-source {
+  background: rgba(0, 230, 118, 0.07);
+  box-shadow: inset 3px 0 0 #00e676;
 }
 
-.track-num {
-  width: 32px;
-  font-family: monospace;
-  font-size: 12px;
-  opacity: 0.4;
+.track-active:hover,
+.playlist-card.active-playlist:hover,
+.source-card.active-source:hover {
+  background: rgba(0, 230, 118, 0.11);
+}
+
+/* Lead slot: equalizer bars on the row that is playing, blank otherwise
+   (track numbers were dropped — they carried no information). */
+.track-lead {
+  width: 12px;
+  height: 12px;
   flex-shrink: 0;
+  color: #00e676;
+  visibility: hidden;
 }
 
-.track-num-active {
-  opacity: 1;
-  font-weight: 700;
-  background: linear-gradient(135deg, #4285F4, #9B72CB, #D96570);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
+.track-active .track-lead {
+  visibility: visible;
 }
 
 .track-info {
@@ -848,67 +838,6 @@ input[type=range]::-webkit-slider-thumb {
   color: #fff;
 }
 
-/* ── Live DJ experience ─────────────────────────────────────── */
-.live-center {
-  justify-content: flex-start;
-  min-height: 0;
-  gap: 1rem;
-}
-
-#ai-state-panel.live-dj-status {
-  max-width: 100%;
-  padding: 18px;
-  gap: 12px;
-  background: rgba(6, 8, 16, 0.48);
-  border-color: rgba(255, 255, 255, 0.1);
-}
-
-.live-dj-status .ai-state-header {
-  align-items: center;
-}
-
-.live-dj-status .ai-state-label {
-  opacity: 0.75;
-}
-
-.live-dj-status .ai-state-main {
-  gap: 14px;
-}
-
-.live-dj-status #ai-state-emoji {
-  width: 34px;
-  font-size: 28px;
-  text-align: center;
-}
-
-.live-dj-status #ai-state-detail {
-  max-width: none;
-  white-space: normal;
-  line-height: 1.4;
-}
-
-.live-btn {
-  width: 100%;
-  height: 58px;
-  padding: 0 22px;
-  border-radius: 16px;
-  font-size: 16px;
-  font-weight: 700;
-  gap: 10px;
-  user-select: none;        /* double-click must not select the label text */
-  touch-action: manipulation; /* no 300ms dbl-tap zoom delay on touch screens */
-}
-
-.live-btn-label {
-  min-height: 20px;
-  text-align: center;
-}
-
-.live-btn-active.live-btn-recording {
-  box-shadow: 0 0 0 4px rgba(66, 133, 244, 0.14), 0 0 40px rgba(66, 133, 244, 0.45);
-}
-
-
 /* ── Queue / Up Next ───────────────────────────────────────── */
 .queue-container {
   margin-bottom: 1rem;
@@ -963,19 +892,21 @@ input[type=range]::-webkit-slider-thumb {
 }
 
 .queue-clear-btn {
-  background: transparent;
-  border: none;
-  color: rgba(255, 255, 255, 0.45);
-  font-size: 11px;
+  background: rgba(244, 67, 54, 0.12);
+  border: 1px solid rgba(244, 67, 54, 0.3);
+  color: #ff8a80;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 4px 8px;
+  border-radius: 6px;
   cursor: pointer;
-  padding: 2px 7px;
-  border-radius: 4px;
-  transition: color 0.2s, background 0.2s;
+  transition: all 0.2s;
 }
 
 .queue-clear-btn:hover {
+  background: rgba(244, 67, 54, 0.28);
+  border-color: rgba(244, 67, 54, 0.6);
   color: #fff;
-  background: rgba(255, 255, 255, 0.12);
 }
 
 .queue-card {
@@ -1188,14 +1119,77 @@ input[type=range]::-webkit-slider-thumb {
 }
 
 /* ── Deck Navigation Tabs ─────────────────────────────────── */
+/* Real tabs: a baseline the inactive tabs sit on, the active tab rises and
+   joins the content area (its bottom border disappears into it). */
 .deck-tabs {
   display: flex;
-  gap: 8px;
+  flex-wrap: nowrap;            /* a horizontal carousel: tabs keep their full width */
+  gap: 4px;
+  padding: 0 6px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-behavior: smooth;
+  scrollbar-width: none;
+  flex: 1;
+  min-width: 0;
+  position: relative;
+}
+
+.deck-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.deck-tabs-wrap {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
   margin-bottom: 12px;
-  background: rgba(0, 0, 0, 0.25);
-  padding: 4px;
-  border-radius: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  position: relative;
+}
+
+/* Fades hint at more tabs to either side */
+.deck-tabs.fade-start {
+  mask-image: linear-gradient(to right, transparent, #000 28px);
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 28px);
+}
+
+.deck-tabs.fade-end {
+  mask-image: linear-gradient(to left, transparent, #000 28px);
+  -webkit-mask-image: linear-gradient(to left, transparent, #000 28px);
+}
+
+.deck-tabs.fade-start.fade-end {
+  mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent);
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent);
+}
+
+.tabs-scroll-btn {
+  flex: 0 0 26px;
+  align-self: center;
+  height: 30px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  color: rgba(255, 255, 255, 0.75);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.2s, opacity 0.2s;
+}
+
+.tabs-scroll-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+
+.tabs-scroll-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.deck-tabs::-webkit-scrollbar {
+  display: none;
 }
 
 .deck-tab {
@@ -1204,26 +1198,42 @@ input[type=range]::-webkit-slider-thumb {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  padding: 8px 12px;
-  background: transparent;
-  border: none;
+  padding: 9px 12px 10px;
+  margin-bottom: -1px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid transparent;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 10px 10px 0 0;
   color: rgba(255, 255, 255, 0.55);
   font-size: 12px;
   font-weight: 600;
-  border-radius: 8px;
+  white-space: nowrap;
   cursor: pointer;
-  transition: all 0.2s;
+  position: relative;
+  transition: color 0.2s, background 0.2s;
 }
 
 .deck-tab:hover {
-  color: rgba(255, 255, 255, 0.85);
-  background: rgba(255, 255, 255, 0.04);
+  color: rgba(255, 255, 255, 0.9);
+  background: rgba(255, 255, 255, 0.05);
 }
 
 .deck-tab.active {
   color: #fff;
-  background: rgba(255, 255, 255, 0.1);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.14);
+  border-bottom-color: transparent;
+}
+
+.deck-tab.active::before {
+  content: "";
+  position: absolute;
+  top: -1px;
+  left: 12px;
+  right: 12px;
+  height: 3px;
+  border-radius: 0 0 3px 3px;
+  background: linear-gradient(90deg, #4285F4, #9B72CB);
 }
 
 .deck-tab-icon {
@@ -1289,7 +1299,7 @@ input[type=range]::-webkit-slider-thumb {
 }
 
 .playlists-list::-webkit-scrollbar {
-  width: 4px;
+  width: 10px;
 }
 
 .playlists-list::-webkit-scrollbar-track {
@@ -1412,14 +1422,46 @@ input[type=range]::-webkit-slider-thumb {
 
 .playlist-card.expanded {
   background: rgba(255, 255, 255, 0.05);
-  border-color: rgba(255, 255, 255, 0.14);
+  border-color: rgba(155, 114, 203, 0.45);
+  box-shadow: inset 3px 0 0 rgba(155, 114, 203, 0.8);
 }
 
+/* Expandable body. JS (_expandBody/_collapseBody) animates `height` between
+   0 and the measured content height, then releases it to auto; the easing
+   and opacity fade live here. Collapsed bodies stay in the DOM at 0 height. */
 .playlist-expanded {
   cursor: default;
+  display: block;
+  height: 0;
+  overflow: hidden;
+  opacity: 0;
+  margin-top: 0;
+  transition: height 0.32s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.24s ease, margin-top 0.32s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.playlist-expanded.open {
   margin-top: 10px;
+  /* An open body rendered without the JS animation (e.g. a card re-rendered
+     while expanded) must still show; the animation overrides these inline. */
+  height: auto;
+  opacity: 1;
+}
+
+.playlist-expanded-inner {
+  min-height: 0;
+}
+
+.playlist-expanded.open .playlist-expanded-inner {
   padding-top: 10px;
   border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .playlist-expanded,
+  .chevron2::before,
+  .chevron2::after {
+    transition: none;
+  }
 }
 
 .playlist-expanded-actions {
@@ -1439,18 +1481,76 @@ input[type=range]::-webkit-slider-thumb {
   max-height: 260px;
 }
 
-/* Shared "👁 View" / "▴ Hide" toggle used by playlist cards and the queue card */
+/* Shared expand/collapse control (playlist & podcast cards, the queue card):
+   a chevron pointing down when collapsed, up when open. */
 .view-toggle-btn {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   background: rgba(255, 255, 255, 0.06);
   border: 1px solid rgba(255, 255, 255, 0.1);
   color: rgba(255, 255, 255, 0.7);
-  font-size: 11px;
-  font-weight: 600;
-  padding: 5px 9px;
   border-radius: 6px;
   cursor: pointer;
-  white-space: nowrap;
   transition: all 0.2s;
+  flex-shrink: 0;
+}
+
+/* The chevron glyph itself: a rotated bordered square, colour = currentColor */
+.chevron {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: translateY(-2px) rotate(45deg);
+  transition: transform 0.2s ease;
+}
+
+.open > .chevron,
+.open .chevron,
+[aria-expanded="true"] > .chevron {
+  transform: translateY(2px) rotate(-135deg);
+}
+
+/* <details> in the finder modals: same chevron instead of the default triangle */
+.modal-details summary {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.modal-details summary::-webkit-details-marker {
+  display: none;
+}
+
+/* <summary> gets the same double chevron via its two pseudo-elements */
+.modal-details summary::before,
+.modal-details summary::after {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: translateY(-3px) rotate(45deg);
+  transition: transform 0.25s ease;
+  flex-shrink: 0;
+}
+
+.modal-details summary::after {
+  margin-left: -13px;
+  transform: translateY(2px) rotate(45deg);
+}
+
+.modal-details[open] summary::before {
+  transform: translateY(3px) rotate(-135deg);
+}
+
+.modal-details[open] summary::after {
+  transform: translateY(-2px) rotate(-135deg);
 }
 
 .view-toggle-btn:hover {
@@ -1459,20 +1559,58 @@ input[type=range]::-webkit-slider-thumb {
 }
 
 .view-toggle-btn.open {
-  background: rgba(155, 114, 203, 0.25);
-  border-color: rgba(155, 114, 203, 0.45);
-  color: #e4d4ff;
+  background: linear-gradient(135deg, rgba(66, 133, 244, 0.45), rgba(155, 114, 203, 0.55));
+  border-color: rgba(155, 114, 203, 0.7);
+  color: #fff;
+  box-shadow: 0 0 12px rgba(155, 114, 203, 0.35);
 }
 
-/* Queue accordion body */
-.queue-expanded {
+/* Double chevron (two stacked chevrons). Points down when collapsed; flips
+   and re-stacks to point up when the parent is .open / aria-expanded. */
+.chevron2 {
+  position: relative;
+  display: inline-block;
+  width: 12px;
+  height: 14px;
+}
+
+.chevron2::before,
+.chevron2::after {
+  content: "";
+  position: absolute;
+  left: 2px;
+  width: 7px;
+  height: 7px;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: rotate(45deg);
+  transition: transform 0.25s ease, top 0.25s ease;
+}
+
+.chevron2::before { top: 0; }
+.chevron2::after { top: 5px; }
+
+.open .chevron2::before,
+.open .chevron2::after,
+[aria-expanded="true"] .chevron2::before,
+[aria-expanded="true"] .chevron2::after {
+  transform: rotate(-135deg);
+}
+
+.open .chevron2::before,
+[aria-expanded="true"] .chevron2::before { top: 3px; }
+.open .chevron2::after,
+[aria-expanded="true"] .chevron2::after { top: 8px; }
+
+/* Queue accordion body (shares .playlist-expanded's animation) */
+.queue-expanded.open {
   margin-top: 10px;
-  padding-top: 8px;
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
 }
 
+/* The cue grows to fit its rows, up to the space left in the column; the
+   list scrolls inside once it runs out (see .now-panel flex rules below). */
 .queue-expanded .track-list {
-  max-height: 240px;
+  max-height: none;
 }
 
 .playlist-cover {
@@ -1583,10 +1721,16 @@ input[type=range]::-webkit-slider-thumb {
   color: #fff;
 }
 
+.playlist-btn-subtle.danger {
+  background: rgba(244, 67, 54, 0.12);
+  border-color: rgba(244, 67, 54, 0.3);
+  color: #ff8a80;
+}
+
 .playlist-btn-subtle.danger:hover {
-  background: rgba(244, 67, 54, 0.2);
-  border-color: rgba(244, 67, 54, 0.4);
-  color: #ff5252;
+  background: rgba(244, 67, 54, 0.3);
+  border-color: rgba(244, 67, 54, 0.6);
+  color: #fff;
 }
 
 /* ── Playlist action buttons (accordion body) ──────────────── */
@@ -1667,8 +1811,9 @@ input[type=range]::-webkit-slider-thumb {
 }
 
 /* ── Queue (Up Next) view ────────────────────────────────────── */
-/* "Play now" is always visible here (unlike the hover-only "+ Cue"). */
-.queue-item-play-btn,
+/* "Play now" is always visible here (unlike the hover-only "+ Cue").
+   Needs the .track-item prefix to outrank the later `.track-play-btn { opacity: 0 }`. */
+.track-item .queue-item-play-btn,
 .track-item:hover .queue-item-play-btn {
   opacity: 1;
   background: rgba(0, 230, 118, 0.15);
@@ -1924,4 +2069,1299 @@ input[type=range]::-webkit-slider-thumb {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 6px;
+}
+
+/* ── Live Radio & Podcasts ───────────────────────────────────── */
+
+/* Four deck tabs: keep labels on one line on narrow panels */
+.deck-tab {
+  white-space: nowrap;
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
+/* Now-playing label: the same gradient for music, radio and podcasts */
+.now-playing-label.live.active {
+  background: linear-gradient(135deg, #4285F4, #9B72CB, #D96570);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* Line under the artist: LIVE / PODCAST badge + genre or episode meta */
+.now-playing-source {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  padding: 3px 9px 3px 4px;
+  border-radius: 999px;
+  font-size: 11px;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #e0e0e0;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.now-playing-source .source-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 6px;
+  color: #fff;
+  background: rgba(155, 114, 203, 0.5);
+  flex-shrink: 0;
+}
+
+/* Live radio uses the same panel colours as every other source; only the
+   badge's blinking dot says "live". */
+.now-playing-source.live .source-badge .live-dot {
+  color: #ff5252;
+}
+
+.now-playing-source .source-line {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Blinking on-air dot (now-playing badge and station-card pill) */
+.live-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: live-blink 1.2s ease-in-out infinite;
+}
+
+@keyframes live-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+.badge-now-playing.badge-live {
+  color: #2b0000;
+  background: #ff5252;
+  box-shadow: 0 0 10px rgba(255, 82, 82, 0.45);
+}
+
+/* Seek slider is inert while live */
+#seek-slider.live,
+#seek-slider:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+/* ↺15 / 30↻ podcast skip buttons */
+.transport-btn.skip-btn {
+  width: 30px;
+  height: 30px;
+  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  flex: 0 0 auto;
+}
+
+.speed-control {
+  flex: 0 0 auto;
+}
+
+.transport-btn.skip-btn small {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+/* Station / podcast cards reuse the playlist card; these tweak the accents */
+.source-card.active-source,
+.podcast-card.active-source {
+  border-color: rgba(0, 230, 118, 0.35);
+}
+
+.source-cover {
+  background-size: cover;
+  background-position: center;
+  font-size: 20px;
+}
+
+.sources-empty {
+  padding: 24px;
+  text-align: center;
+  opacity: 0.6;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* Episode rows inside an expanded podcast card */
+.episode-item {
+  align-items: flex-start;
+}
+
+.episode-info {
+  min-width: 0;
+}
+
+.episode-item .track-title {
+  white-space: normal;
+  line-height: 1.3;
+}
+
+.episode-meta {
+  margin-top: 2px;
+}
+
+.episode-progress {
+  height: 3px;
+  margin-top: 6px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+  max-width: 220px;
+}
+
+.episode-progress i {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #4285F4, #9B72CB);
+  border-radius: 2px;
+}
+
+/* Directory search results inside the add-station / subscribe modals */
+.directory-results {
+  max-height: 200px;
+  margin-bottom: 4px;
+}
+
+.directory-hint {
+  padding: 10px;
+  font-size: 12px;
+  opacity: 0.55;
+  text-align: center;
+  line-height: 1.5;
+}
+
+.directory-row {
+  cursor: default;
+  align-items: center;
+  gap: 10px;
+}
+
+.directory-row-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+  gap: 2px;
+}
+
+.directory-row-meta {
+  font-size: 10px;
+  opacity: 0.55;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.directory-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.directory-row-actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
+  transform: none;
+}
+
+.modal-form-group + .modal-form-group {
+  margin-top: 8px;
+}
+
+
+/* ── Podcast episode panel (under NOW PLAYING) ─────────────── */
+.episode-panel {
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.episode-panel-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+  font-size: 11px;
+}
+
+.episode-panel-label {
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: #fff;
+  background: rgba(155, 114, 203, 0.5);
+  padding: 2px 7px;
+  border-radius: 6px;
+}
+
+.episode-panel-meta {
+  color: #e0e0e0;
+  font-weight: 600;
+}
+
+.episode-panel-remaining {
+  opacity: 0.6;
+}
+
+.episode-notes {
+  font-size: 12px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.8);
+  white-space: pre-line;
+}
+
+.episode-notes.clamped {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.episode-notes.muted {
+  opacity: 0.5;
+  font-style: italic;
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  padding: 4px 0 0;
+  color: #90caf9;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.link-btn:hover {
+  text-decoration: underline;
+}
+
+/* Episode description excerpt in the Podcasts tab */
+.episode-excerpt {
+  font-size: 11px;
+  line-height: 1.4;
+  color: rgba(255, 255, 255, 0.55);
+  margin-top: 3px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* ── Starter picks ─────────────────────────────────────────── */
+.starter-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(155, 114, 203, 0.12);
+  border: 1px solid rgba(155, 114, 203, 0.35);
+  font-size: 12px;
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.starter-note-icon {
+  font-size: 16px;
+  line-height: 1.2;
+}
+
+.starter-note-text {
+  flex: 1;
+}
+
+.starter-note-dismiss {
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.5);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0 2px;
+}
+
+.starter-note-dismiss:hover {
+  color: #fff;
+}
+
+.badge-starter {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: #d8c2ff;
+  background: rgba(155, 114, 203, 0.25);
+  border: 1px solid rgba(155, 114, 203, 0.4);
+  padding: 1px 6px;
+  border-radius: 6px;
+  flex-shrink: 0;
+}
+
+/* ── Finder modals: genre/category chips, collapsible URL form ── */
+.modal-card-wide {
+  max-width: 560px;
+  width: 94%;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 10px;
+}
+
+.chip {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: rgba(255, 255, 255, 0.8);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 5px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.chip:hover {
+  background: rgba(155, 114, 203, 0.25);
+  border-color: rgba(155, 114, 203, 0.5);
+  color: #fff;
+}
+
+.chip-accent {
+  background: rgba(255, 152, 0, 0.15);
+  border-color: rgba(255, 152, 0, 0.4);
+  color: #ffe0b2;
+}
+
+.modal-details {
+  margin-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding-top: 8px;
+}
+
+.modal-details summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.6);
+  margin-bottom: 8px;
+}
+
+.modal-details summary:hover {
+  color: #fff;
+}
+
+/* The browse panel's lists take the remaining height instead of a fixed cap */
+.browse-panel .track-list,
+.browse-panel .playlists-list {
+  max-height: none;
+  flex: 1;
+}
+
+.browse-panel .deck-view {
+  overflow: hidden;
+}
+
+@media (max-width: 900px) {
+  .browse-panel .track-list,
+  .browse-panel .playlists-list {
+    max-height: 360px;
+  }
+  .topbar {
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+  .dj-readout {
+    order: 3;
+    flex-basis: 100%;
+  }
+  .topbar-controls {
+    margin-left: auto;
+  }
+}
+
+
+/* ── Row play buttons, selection, cue buttons (V7.1) ───────── */
+/* ▶ on list rows: same family as "+ Cue", green accent, shown on hover/selection */
+.track-play-btn {
+  opacity: 0;
+  background: rgba(0, 230, 118, 0.14);
+  border: 1px solid rgba(0, 230, 118, 0.3);
+  color: #69f0ae;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: opacity 0.2s, background 0.2s, transform 0.1s;
+  flex-shrink: 0;
+}
+
+.track-item:hover .track-play-btn,
+.track-item.track-selected .track-play-btn,
+.track-item.track-selected .track-cue-btn,
+.track-item.track-selected .track-add-playlist-btn,
+.track-item.track-active .track-play-btn {
+  opacity: 1;
+}
+
+.track-play-btn:hover {
+  background: rgba(0, 230, 118, 0.32);
+  color: #fff;
+  transform: scale(1.05);
+}
+
+/* Selected row (click) — distinct from the now-playing row (track-active) */
+.track-item.track-selected {
+  background: rgba(155, 114, 203, 0.14);
+  box-shadow: inset 0 0 0 1px rgba(155, 114, 203, 0.45);
+}
+
+.track-item:focus-visible,
+.source-card:focus-visible {
+  outline: 2px solid rgba(66, 133, 244, 0.6);
+  outline-offset: -2px;
+}
+
+.source-card.source-selected {
+  box-shadow: inset 0 0 0 1px rgba(155, 114, 203, 0.5);
+  background: rgba(155, 114, 203, 0.1);
+}
+
+/* "+ Cue" on playlist / podcast card headers (always visible, matches row cue buttons) */
+.playlist-btn-cue {
+  background: rgba(155, 114, 203, 0.18);
+  border: 1px solid rgba(155, 114, 203, 0.35);
+  color: #d8c2ff;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 5px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.2s;
+}
+
+.playlist-btn-cue:hover {
+  background: rgba(155, 114, 203, 0.4);
+  color: #fff;
+  transform: scale(1.05);
+}
+
+.link-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+
+/* ── Library: virtual list, toolbar, sort bar (V7.2) ───────── */
+.track-list.virtual {
+  position: relative;
+  min-height: 200px;
+  contain: layout paint;   /* not `size`: the list takes its height from the flex column */
+}
+
+.vlist-spacer {
+  width: 1px;
+  pointer-events: none;
+}
+
+.vlist-rows {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 8px;
+  will-change: transform;
+}
+
+.track-list.virtual .track-item {
+  height: 52px;
+  box-sizing: border-box;
+  padding: 0 12px;
+}
+
+.track-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: -4px 0 8px;
+  font-size: 11px;
+}
+
+.track-count {
+  color: rgba(255, 255, 255, 0.5);
+  white-space: nowrap;
+}
+
+.sort-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.sort-label {
+  color: rgba(255, 255, 255, 0.4);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  font-size: 9px;
+  margin-right: 2px;
+}
+
+.sort-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.sort-btn:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.sort-btn.active {
+  color: #d8c2ff;
+  background: rgba(155, 114, 203, 0.2);
+  border-color: rgba(155, 114, 203, 0.4);
+}
+
+/* Lists in the browse panel: isolate layout/paint work from the rest of the page */
+.playlists-list,
+.playlist-expanded-tracks {
+  contain: content;
+}
+
+/* ── Button families (V7.2): play = green, remove = red ────── */
+#queue-play-now-btn {
+  background: rgba(0, 230, 118, 0.14);
+  border-color: rgba(0, 230, 118, 0.3);
+  color: #69f0ae;
+}
+
+#queue-play-now-btn:hover {
+  background: rgba(0, 230, 118, 0.32);
+  color: #fff;
+}
+
+#queue-remove-btn {
+  background: rgba(244, 67, 54, 0.12);
+  border-color: rgba(244, 67, 54, 0.3);
+  color: #ff8a80;
+}
+
+#queue-remove-btn:hover {
+  background: rgba(244, 67, 54, 0.3);
+  color: #fff;
+}
+
+/* A playing station's button turns into Stop: red, like every destructive control */
+.playlist-btn-play.is-stop {
+  background: rgba(244, 67, 54, 0.15);
+  border-color: rgba(244, 67, 54, 0.35);
+  color: #ff8a80;
+}
+
+.playlist-btn-play.is-stop:hover {
+  background: rgba(244, 67, 54, 0.35);
+  border-color: rgba(244, 67, 54, 0.6);
+  color: #fff;
+}
+
+.modal-btn-confirm.danger {
+  background: linear-gradient(135deg, rgba(244, 67, 54, 0.55), rgba(255, 82, 82, 0.7));
+  border-color: rgba(244, 67, 54, 0.7);
+}
+
+.modal-card-narrow {
+  max-width: 400px;
+}
+
+/* Playback speed (podcasts) */
+.transport-btn.speed-btn {
+  width: 42px;
+  height: 38px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: -0.3px;
+  border-radius: 10px;
+}
+
+.transport-btn.speed-btn.active {
+  color: #69f0ae;
+  background: rgba(0, 230, 118, 0.12);
+}
+
+.track-play-from-btn {
+  white-space: nowrap;
+}
+
+
+/* ── V7.3: scrollbars, grouped library, speed menu, finder badges ── */
+/* Wider, easier-to-grab scroll handles everywhere that scrolls */
+.track-list,
+.playlists-list,
+.now-panel,
+.modal-playlists-list,
+.queue-expanded .track-list {
+  scrollbar-width: auto;
+  scrollbar-color: rgba(255, 255, 255, 0.28) transparent;
+}
+
+.track-list::-webkit-scrollbar-thumb,
+.playlists-list::-webkit-scrollbar-thumb,
+.now-panel::-webkit-scrollbar-thumb,
+.modal-playlists-list::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.28);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  min-height: 36px;
+}
+
+.track-list::-webkit-scrollbar-thumb:hover,
+.playlists-list::-webkit-scrollbar-thumb:hover,
+.now-panel::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.45);
+  background-clip: padding-box;
+}
+
+.now-panel::-webkit-scrollbar,
+.modal-playlists-list::-webkit-scrollbar {
+  width: 10px;
+}
+
+.now-panel::-webkit-scrollbar-track,
+.modal-playlists-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Group header rows in the hierarchical Library */
+.track-group {
+  height: 52px;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+  margin-top: 2px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  cursor: pointer;
+  user-select: none;
+}
+
+.track-group:hover {
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.track-group.open {
+  background: rgba(155, 114, 203, 0.12);
+  border-color: rgba(155, 114, 203, 0.35);
+}
+
+.track-group-label {
+  font-weight: 700;
+  font-size: 13px;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.track-group-count {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.5);
+  white-space: nowrap;
+}
+
+.track-group .group-toggle {
+  pointer-events: none;
+  width: 24px;
+  height: 24px;
+}
+
+.groups-toggle {
+  margin-left: 6px;
+  border-color: rgba(255, 255, 255, 0.15);
+}
+
+/* Playback speed dropdown (podcasts) */
+.speed-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 4px;
+  padding: 4px 6px 4px 10px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+}
+
+.speed-control.active {
+  border-color: rgba(0, 230, 118, 0.4);
+  color: #69f0ae;
+}
+
+.transport-select {
+  appearance: none;
+  -webkit-appearance: none;
+  background: rgba(0, 0, 0, 0.35) url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path d='M1 1l4 4 4-4' fill='none' stroke='%23ffffff' stroke-opacity='0.7' stroke-width='1.6'/></svg>") no-repeat right 8px center;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #f0f0f0;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 4px 24px 4px 8px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.transport-select:focus-visible {
+  outline: 2px solid rgba(66, 133, 244, 0.6);
+}
+
+.transport-select option {
+  background: #1a1a24;
+  color: #f0f0f0;
+}
+
+/* Station finder: country field and verification badge */
+.modal-input-narrow {
+  flex: 0 0 150px;
+}
+
+.directory-note {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.5);
+  line-height: 1.45;
+  margin: 2px 0 6px;
+}
+
+.badge-unverified {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: #ffe0b2;
+  background: rgba(255, 152, 0, 0.16);
+  border: 1px solid rgba(255, 152, 0, 0.4);
+  padding: 1px 6px;
+  border-radius: 6px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+
+/* ── V7.4: group header actions, finder secondary row, provider badge ── */
+.track-group .track-play-btn,
+.track-group .track-cue-btn {
+  opacity: 0.85;
+  padding: 3px 8px;
+}
+
+.track-group:hover .track-play-btn,
+.track-group:hover .track-cue-btn {
+  opacity: 1;
+}
+
+.track-group .group-toggle {
+  margin-left: 4px;
+}
+
+.modal-create-row-secondary {
+  margin-top: 6px;
+}
+
+.modal-create-row-secondary .modal-input {
+  font-size: 12px;
+  padding: 7px 10px;
+}
+
+.badge-provider {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: #90caf9;
+  background: rgba(66, 133, 244, 0.15);
+  border: 1px solid rgba(66, 133, 244, 0.4);
+  padding: 1px 6px;
+  border-radius: 6px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   V7.2 — Audiobooks & Streaming
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Setup notes (feature not configured) reuse the starter-note look in amber */
+.starter-note.setup-note {
+  background: rgba(255, 193, 7, 0.08);
+  border-color: rgba(255, 193, 7, 0.35);
+}
+
+.starter-note code {
+  font-family: 'Consolas', 'Menlo', monospace;
+  font-size: 11px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* Audiobook cards */
+.book-status {
+  margin-top: 2px;
+}
+
+.book-progress {
+  margin-top: 6px;
+  max-width: 260px;
+}
+
+.badge-finished {
+  color: #b9f6ca;
+  background: rgba(0, 200, 83, 0.18);
+  border-color: rgba(0, 200, 83, 0.4);
+}
+
+.chapter-item.chapter-heard .track-title,
+.chapter-item.chapter-heard .episode-meta {
+  opacity: 0.55;
+}
+
+.chapter-item.track-active .track-title {
+  opacity: 1;
+}
+
+/* Streaming tab: one search, a sub-section per provider */
+.streaming-search-row {
+  margin-bottom: 10px;
+}
+
+.streaming-sections {
+  gap: 10px;
+}
+
+.streaming-section .playlist-card-header {
+  cursor: pointer;
+}
+
+.streaming-section-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.streaming-hint {
+  padding: 12px;
+  text-align: left;
+}
+
+.streaming-albums {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.streaming-album {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.badge-available {
+  color: #b9f6ca;
+  background: rgba(0, 200, 83, 0.18);
+  border-color: rgba(0, 200, 83, 0.4);
+}
+
+.badge-unavailable {
+  color: #ffcc80;
+  background: rgba(255, 152, 0, 0.16);
+  border-color: rgba(255, 152, 0, 0.4);
+}
+
+.stream-track-item {
+  gap: 10px;
+}
+
+.stream-track-item.stream-unplayable .track-title,
+.stream-track-item.stream-unplayable .track-artist {
+  opacity: 0.5;
+}
+
+.stream-track-art {
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  overflow: hidden;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.06);
+  font-size: 16px;
+}
+
+.stream-track-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.badge-mode {
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 6px;
+  flex-shrink: 0;
+  color: #0b2e17;
+  background: #69f0ae;
+}
+
+.badge-mode.full {
+  color: #fff;
+  background: rgba(66, 133, 244, 0.7);
+}
+
+.badge-mode.none {
+  color: #e0e0e0;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.badge-explicit {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 800;
+  line-height: 1;
+  padding: 2px 4px;
+  margin-left: 4px;
+  border-radius: 3px;
+  color: #111;
+  background: rgba(255, 255, 255, 0.6);
+  vertical-align: middle;
+}
+
+.now-playing-source.stream .source-badge {
+  background: rgba(66, 133, 244, 0.55);
+}
+
+.now-playing-source.audiobook .source-badge {
+  background: rgba(255, 152, 0, 0.5);
+}
+
+/* Carousel tabs never shrink: each keeps its full label; the row scrolls. */
+.deck-tab {
+  flex: 0 0 auto;
+  gap: 5px;
+  padding-left: 10px;
+  padding-right: 10px;
+}
+
+.deck-tab .deck-tab-label {
+  white-space: nowrap;
+}
+
+/* ⏸ Pause variant of the green play controls (audiobook card + chapter rows) */
+.playlist-btn-play.is-pause,
+.track-play-btn.is-pause {
+  background: rgba(255, 193, 7, 0.16);
+  border-color: rgba(255, 193, 7, 0.45);
+  color: #ffd54f;
+  opacity: 1;
+}
+
+.playlist-btn-play.is-pause:hover,
+.track-play-btn.is-pause:hover {
+  background: rgba(255, 193, 7, 0.32);
+  color: #fff;
+}
+
+/* Library loading message (server still scanning the music folder) */
+.library-loading {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 2px 0 10px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(66, 133, 244, 0.1);
+  border: 1px solid rgba(66, 133, 244, 0.35);
+  font-size: 12px;
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.library-loading-icon {
+  font-size: 18px;
+  line-height: 1;
+}
+
+.library-loading-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+
+.library-progress {
+  margin-top: 4px;
+  max-width: 320px;
+}
+
+
+/* "More results" at the bottom of a streaming section */
+.streaming-more-btn {
+  align-self: center;
+  margin-top: 2px;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   V7.6 — auto-sizing cue, Playlists section under the cue, drag & drop,
+   draggable tab carousel, newest-episodes card, filter icons
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Player column: fixed header parts, then the cue (as tall as it needs, up to
+   the room available) and the Playlists section sharing what is left. */
+.now-panel {
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;          /* only scrolls if the fixed parts alone don't fit */
+}
+
+.now-panel > .now-playing,
+.now-panel > .episode-panel,
+.now-panel > .slider-container,
+.now-panel > .transport,
+.now-panel > .playlist-toast {
+  flex: 0 0 auto;
+}
+
+.queue-container {
+  display: flex;
+  flex-direction: column;
+  flex: 0 1 auto;          /* as tall as its rows need, shrinking only once Playlists is at its minimum */
+  min-height: 0;
+}
+
+.queue-expanded.open {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.queue-expanded.open > .playlist-expanded-inner {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.queue-expanded.open #queue-tracks-container {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.playlists-section {
+  display: flex;
+  flex-direction: column;
+  /* Takes whatever the cue leaves, and gives way first (huge shrink factor)
+     when the cue needs the room — but never below its minimum. */
+  flex: 1 1000 auto;
+  min-height: 124px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 14px;
+  padding: 10px 14px;
+}
+
+.playlists-section.collapsed {
+  flex: 0 0 auto;
+  min-height: 0;
+}
+
+.playlists-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  margin-top: 8px;
+}
+
+.playlists-body .playlists-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+}
+
+.track-filter-wrap.compact {
+  padding: 4px 10px;
+  margin-bottom: 8px;
+}
+
+/* Funnel icon in filter fields (searches keep the magnifier) */
+.filter-icon {
+  flex-shrink: 0;
+  opacity: 0.55;
+  color: #fff;
+}
+
+/* Drag & drop */
+.track-item[draggable="true"],
+.track-group[draggable="true"] {
+  cursor: grab;
+}
+
+.track-item.dragging {
+  opacity: 0.4;
+}
+
+.drag-ghost {
+  position: fixed;
+  top: -100px;
+  left: -100px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+  background: rgba(66, 133, 244, 0.9);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+body.dragging-tracks .queue-container,
+body.dragging-tracks .playlist-card {
+  outline: 1px dashed rgba(66, 133, 244, 0.35);
+  outline-offset: 2px;
+}
+
+.queue-container.drag-over,
+.playlist-card.drag-over {
+  outline: 2px solid rgba(0, 230, 118, 0.7);
+  outline-offset: 2px;
+  background: rgba(0, 230, 118, 0.06);
+}
+
+.playlist-card.drag-refuse {
+  outline: 2px solid rgba(255, 82, 82, 0.6);
+  outline-offset: 2px;
+}
+
+.track-item.drop-before {
+  box-shadow: inset 0 2px 0 0 #00e676;
+}
+
+.track-item.drop-after {
+  box-shadow: inset 0 -2px 0 0 #00e676;
+}
+
+/* Tab carousel: draggable, snapping */
+.deck-tabs {
+  cursor: grab;
+  scroll-snap-type: x proximity;
+  user-select: none;
+}
+
+.deck-tabs.grabbing {
+  cursor: grabbing;
+  scroll-snap-type: none;
+}
+
+.deck-tab {
+  scroll-snap-align: start;
+}
+
+/* Newest episodes card on the Podcasts tab */
+.latest-episodes {
+  margin-bottom: 10px;
+  flex: 0 0 auto;
+}
+
+.latest-episodes .playlist-card-header {
+  cursor: pointer;
+}
+
+.latest-episodes .podcast-episodes {
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+/* Clamped descriptions (podcast blurbs, episode notes) with a More/Less link
+   that only appears when the text overflows */
+.clampable {
+  display: -webkit-box;
+  -webkit-line-clamp: var(--clamp-lines, 2);
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: normal;
+}
+
+.clampable.expanded {
+  display: block;
+  -webkit-line-clamp: unset;
+  overflow: visible;
+}
+
+.clamp-toggle {
+  font-size: 11px;
+  padding: 0;
+  margin-top: 2px;
+  color: #9fc4ff;
+  background: none;
+  border: none;
+  cursor: pointer;
+  align-self: flex-start;
+}
+
+.clamp-toggle:hover {
+  text-decoration: underline;
 }

@@ -8,163 +8,325 @@
 </head>
 <body>
 
-  <canvas id="visualizer"></canvas>
   <div class="bg-blob bg-blob-1"></div>
   <div class="bg-blob bg-blob-2"></div>
 
-  <div class="container">
+  <div class="app">
 
-    <!-- ═══ LEFT PANEL ═══ -->
-    <div class="glass">
-      <div class="card-header">
-        <div class="brand">
-          <div class="brand-icon"></div>
-          <h1>AI DJ Live</h1>
-        </div>
+    <!-- ═══ TOP BAR: brand · DJ status readout · Live toggle · volume ═══ -->
+    <header class="glass topbar">
+      <div class="brand">
+        <div class="brand-icon"></div>
+        <h1>AI DJ Live</h1>
       </div>
 
-      <div class="live-center">
-        <section id="ai-state-panel" class="live-dj-status" aria-live="polite">
-          <div class="ai-state-header">
-            <span class="ai-state-label">Live DJ</span>
-            <div id="status-badge" class="status-badge status-off">
-              <div id="status-dot" class="status-dot"></div>
+      <section id="ai-state-panel" class="dj-readout" aria-live="polite">
+        <span id="ai-state-emoji" class="dj-readout-emoji" aria-hidden="true">⚫</span>
+        <div class="dj-readout-text">
+          <div class="dj-readout-row">
+            <span id="ai-state-name" class="dj-readout-name">Off air</span>
+            <span id="status-badge" class="status-badge status-off">
+              <span id="status-dot" class="status-dot"></span>
               <span id="status-text">Offline</span>
+            </span>
+          </div>
+          <span id="ai-state-detail" class="dj-readout-detail">Say “Hey DJ” or switch Live on.</span>
+          <div id="ai-countdown-wrap" class="ai-countdown-wrap"><div id="ai-countdown-bar"></div></div>
+        </div>
+        <span id="ai-countdown-text" class="dj-countdown-text"></span>
+      </section>
+
+      <div class="topbar-controls">
+        <button id="live-btn" class="live-toggle" type="button" role="switch" aria-checked="false" title="Live mode: talk to AI DJ">
+          <span id="live-btn-icon" class="live-toggle-icon" aria-hidden="true">🎙️</span>
+          <span id="live-btn-text" class="live-toggle-text">Go Live</span>
+          <span class="live-toggle-track" aria-hidden="true"><span class="live-toggle-knob"></span></span>
+        </button>
+        <div class="volume-control" title="Volume">
+          <span aria-hidden="true">🔈</span>
+          <input type="range" id="volume-slider" min="0" max="1" step="0.01" value="1" aria-label="Volume" />
+          <span aria-hidden="true">🔊</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="deck">
+
+      <!-- ═══ NOW PLAYING ═══ -->
+      <section class="glass now-panel">
+        <div class="now-playing">
+          <div class="now-thumb-wrap">
+            <div id="now-thumb" class="now-thumb">💿</div>
+            <span id="now-thumb-kind" class="now-thumb-kind" style="display:none;"></span>
+            <span id="now-thumb-playing" class="now-thumb-playing eq-bars" aria-hidden="true" style="display:none;"><i></i><i></i><i></i></span>
+          </div>
+          <div class="overflow-hidden now-text">
+            <div id="now-playing-state" class="now-playing-label">⏸ Paused</div>
+            <div id="now-playing-title" class="now-playing-title">(Ready)</div>
+            <div id="now-playing-artist" class="now-playing-artist">—</div>
+            <div id="now-playing-source" class="now-playing-source" style="display:none;"></div>
+            <div id="now-playing-playlist" class="now-playing-playlist" style="display:none;"></div>
+          </div>
+        </div>
+
+        <!-- Podcast episode / audiobook chapter details (hidden unless one is loaded) -->
+        <div id="episode-panel" class="episode-panel" style="display:none;">
+          <div class="episode-panel-head">
+            <span id="episode-panel-label" class="episode-panel-label">Episode</span>
+            <span id="episode-meta" class="episode-panel-meta"></span>
+            <span id="episode-remaining" class="episode-panel-remaining"></span>
+          </div>
+          <p id="episode-notes" class="episode-notes clamped"></p>
+          <button id="episode-notes-toggle" class="link-btn" type="button" style="display:none;">Show more</button>
+        </div>
+
+        <div class="slider-container">
+          <span id="time-current" class="slider-time">0:00</span>
+          <input type="range" id="seek-slider" min="0" max="100" value="0" aria-label="Seek" />
+          <span id="time-duration" class="slider-time">0:00</span>
+        </div>
+        <div class="transport">
+          <button id="skip-back-btn" class="transport-btn skip-btn" style="display:none;" title="Back 15 seconds" aria-label="Back 15 seconds">↺<small>15</small></button>
+          <button id="prev-btn" class="transport-btn" title="Previous">⏮</button>
+          <button id="play-pause-btn" class="play-btn" title="Play / Pause"><span id="play-pause-icon">▶</span></button>
+          <button id="next-btn" class="transport-btn" title="Next">⏭</button>
+          <button id="skip-fwd-btn" class="transport-btn skip-btn" style="display:none;" title="Forward 30 seconds" aria-label="Forward 30 seconds"><small>30</small>↻</button>
+          <label class="speed-control" id="speed-control" style="display:none;" title="Playback speed (podcasts and audiobooks)">
+            <span class="speed-control-label" aria-hidden="true">Speed</span>
+            <select id="speed-select" class="transport-select" aria-label="Playback speed">
+              <option value="0.8">0.8×</option>
+              <option value="1" selected>1×</option>
+              <option value="1.25">1.25×</option>
+              <option value="1.5">1.5×</option>
+              <option value="1.75">1.75×</option>
+              <option value="2">2×</option>
+              <option value="2.5">2.5×</option>
+            </select>
+          </label>
+        </div>
+
+        <!-- ─── Toast (playlist / source notifications) ─── -->
+        <div id="playlist-toast" class="playlist-toast" style="display:none;">
+          <div class="playlist-toast-content">
+            <span class="playlist-toast-icon">✨</span>
+            <div class="playlist-toast-text">
+              <span id="playlist-toast-title" class="playlist-toast-title">AI DJ created a playlist</span>
+              <span id="playlist-toast-detail" class="playlist-toast-detail">Now playing your curated mix</span>
             </div>
           </div>
-          <div class="ai-state-main">
-            <span id="ai-state-emoji">⚫</span>
-            <div class="ai-state-text">
-              <span id="ai-state-name">AI DJ is off air</span>
-              <span id="ai-state-detail">Say “Hey DJ” or press Talk Live to start.</span>
+          <button id="playlist-toast-view-btn" class="playlist-toast-btn">View</button>
+        </div>
+
+        <!-- ─── Up Next / Queue Card ─── -->
+        <div id="queue-container" class="queue-container">
+          <div class="queue-header">
+            <div class="queue-badge-group">
+              <span class="queue-badge">UP NEXT</span>
+              <span id="queue-count" class="queue-count">Empty</span>
+            </div>
+            <div class="queue-header-actions">
+              <button id="queue-save-btn" class="queue-save-btn" style="display:none;" title="Save current queue as a playlist">💾 Save</button>
+              <button id="queue-clear-btn" class="queue-clear-btn" style="display:none;" title="Clear Queue">Clear</button>
+              <button id="queue-view-btn" class="view-toggle-btn" type="button" style="display:none;" aria-expanded="true" title="Hide the full queue"><span class="chevron2"></span></button>
             </div>
           </div>
-          <div id="ai-countdown-wrap" class="ai-countdown-wrap">
-            <div id="ai-countdown-bar"></div>
+          <div id="queue-card" class="queue-card empty">
+            <div id="queue-thumb" class="queue-thumb">🎵</div>
+            <div class="queue-info">
+              <div id="queue-title" class="queue-title">No song cued up</div>
+              <div id="queue-artist" class="queue-artist">Ask AI DJ: “Queue up [song]”</div>
+            </div>
+            <div id="queue-actions" class="queue-actions" style="display:none;">
+              <button id="queue-play-now-btn" class="queue-btn-action" title="Play next song now">▶ Play</button>
+              <button id="queue-remove-btn" class="queue-btn-action" title="Remove from queue">✕</button>
+            </div>
           </div>
-          <div id="ai-countdown-text"></div>
+          <div id="queue-expanded" class="queue-expanded playlist-expanded">
+            <div class="playlist-expanded-inner">
+              <div id="queue-tracks-container" class="track-list"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ─── Playlists (saved & AI mixes) — below the cue; drop tracks on a card to add them ─── -->
+        <section id="playlists-section" class="playlists-section">
+          <div class="queue-header playlists-header">
+            <div class="queue-badge-group">
+              <span class="queue-badge">PLAYLISTS</span>
+              <span id="playlists-count" class="queue-count">0</span>
+            </div>
+            <div class="queue-header-actions">
+              <button id="new-playlist-btn" class="queue-save-btn" type="button" title="Create a new playlist">+ New</button>
+              <button id="playlists-view-btn" class="view-toggle-btn" type="button" aria-expanded="true" title="Hide the playlists"><span class="chevron2"></span></button>
+            </div>
+          </div>
+          <div id="playlists-body" class="playlists-body">
+            <div class="track-filter-wrap compact">
+              <svg class="filter-icon" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M1.5 2.5h13l-5 5.8v4.2l-3 1.5V8.3z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+              <input type="text" id="playlist-filter" class="track-filter-input" placeholder="Filter playlists..." />
+              <button id="playlist-filter-clear" class="filter-clear-btn" style="display:none;">✕</button>
+            </div>
+            <div id="playlists-list" class="playlists-list"></div>
+          </div>
         </section>
+      </section>
 
-        <button id="live-btn" class="live-btn" type="button" aria-pressed="false">
-          <span id="live-btn-icon" aria-hidden="true">🎙️</span>
-          <span id="live-btn-text">Talk Live</span>
-        </button>
-        <div id="live-btn-label" class="live-btn-label">Preparing AI DJ…</div>
-      </div>
-    </div>
-
-    <!-- ═══ RIGHT PANEL ═══ -->
-    <div class="glass">
-      <div class="deck-label">
-        <span>Deck_1.A // Local_Library</span>
-        <div class="slider-container" style="width:auto; margin-bottom:0; gap:5px;">
-          <span style="font-size:12px;">🔈</span>
-          <input type="range" id="volume-slider" min="0" max="1" step="0.01" value="1" />
-          <span style="font-size:12px;">🔊</span>
-        </div>
-      </div>
-      <div class="now-playing">
-        <div id="disc-icon" class="disc">💿</div>
-        <div class="overflow-hidden">
-          <div id="now-playing-state" class="now-playing-label">⏸ Paused</div>
-          <div id="now-playing-title" class="now-playing-title">(Ready)</div>
-          <div id="now-playing-artist" class="now-playing-artist">—</div>
-          <div id="now-playing-playlist" class="now-playing-playlist" style="display:none;"></div>
-        </div>
-      </div>
-      <div class="slider-container">
-        <span id="time-current" class="slider-time">0:00</span>
-        <input type="range" id="seek-slider" min="0" max="100" value="0" />
-        <span id="time-duration" class="slider-time">0:00</span>
-      </div>
-      <div class="transport">
-        <button id="prev-btn" class="transport-btn">⏮</button>
-        <button id="play-pause-btn" class="play-btn"><span id="play-pause-icon">▶</span></button>
-        <button id="next-btn" class="transport-btn">⏭</button>
-      </div>
-
-      <!-- ─── Dynamic AI Playlist Banner / Toast ─── -->
-      <div id="playlist-toast" class="playlist-toast" style="display:none;">
-        <div class="playlist-toast-content">
-          <span class="playlist-toast-icon">✨</span>
-          <div class="playlist-toast-text">
-            <span id="playlist-toast-title" class="playlist-toast-title">AI DJ created a playlist</span>
-            <span id="playlist-toast-detail" class="playlist-toast-detail">Now playing your curated mix</span>
+      <!-- ═══ BROWSE SOURCES (one tab per source; add a tab + view for new sources) ═══ -->
+      <section class="glass browse-panel">
+        <!-- Tab carousel: one row that scrolls horizontally; ‹ › nudge it and the
+             active tab is kept centred so it and its neighbours are fully visible -->
+        <div class="deck-tabs-wrap">
+          <button id="tabs-prev-btn" class="tabs-scroll-btn" type="button" aria-label="Scroll tabs left" title="More tabs">‹</button>
+          <div id="deck-tabs" class="deck-tabs" role="tablist">
+          <button id="tab-tracks" class="deck-tab active" type="button" role="tab" title="Your local music library">
+            <span class="deck-tab-icon">🎵</span>
+            <span class="deck-tab-label">Music</span>
+            <span id="badge-tracks-count" class="tab-badge">0</span>
+          </button>
+          <button id="tab-radio" class="deck-tab" type="button" role="tab" title="Live internet radio">
+            <span class="deck-tab-icon">📻</span>
+            <span class="deck-tab-label">Radio</span>
+            <span id="badge-radio-count" class="tab-badge">0</span>
+          </button>
+          <button id="tab-podcasts" class="deck-tab" type="button" role="tab" title="Podcast subscriptions">
+            <span class="deck-tab-icon">🎙</span>
+            <span class="deck-tab-label">Podcasts</span>
+            <span id="badge-podcasts-count" class="tab-badge">0</span>
+          </button>
+          <button id="tab-audiobooks" class="deck-tab" type="button" role="tab" title="Local audiobooks (AUDIOBOOKS_DIR)">
+            <span class="deck-tab-icon">📖</span>
+            <span class="deck-tab-label">Audiobooks</span>
+            <span id="badge-audiobooks-count" class="tab-badge">0</span>
+          </button>
+          <button id="tab-streaming" class="deck-tab" type="button" role="tab" title="Online streaming sources (Apple Music, Deezer, YouTube Music)">
+            <span class="deck-tab-icon">🌐</span>
+            <span class="deck-tab-label">Streaming</span>
+            <span id="badge-streaming-count" class="tab-badge" title="Available streaming sources">0</span>
+          </button>
           </div>
+          <button id="tabs-next-btn" class="tabs-scroll-btn" type="button" aria-label="Scroll tabs right" title="More tabs">›</button>
         </div>
-        <button id="playlist-toast-view-btn" class="playlist-toast-btn">View</button>
-      </div>
 
-      <!-- ─── Up Next / Queue Card ─── -->
-      <div id="queue-container" class="queue-container">
-        <div class="queue-header">
-          <div class="queue-badge-group">
-            <span class="queue-badge">UP NEXT</span>
-            <span id="queue-count" class="queue-count">Empty</span>
+        <!-- ─── VIEW: Library tracks ─── -->
+        <div id="tracks-view" class="deck-view active-view">
+          <div class="track-filter-wrap">
+            <svg class="filter-icon" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M1.5 2.5h13l-5 5.8v4.2l-3 1.5V8.3z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+            <input type="text" id="track-filter" class="track-filter-input" placeholder="Filter tracks by title, artist, album, genre..." />
+            <button id="track-filter-clear" class="filter-clear-btn" style="display:none;">✕</button>
           </div>
-          <div class="queue-header-actions">
-            <button id="queue-view-btn" class="view-toggle-btn" type="button" style="display:none;" aria-expanded="false">👁 View</button>
-            <button id="queue-save-btn" class="queue-save-btn" style="display:none;" title="Save current queue as a playlist">💾 Save</button>
-            <button id="queue-clear-btn" class="queue-clear-btn" style="display:none;" title="Clear Queue">Clear</button>
+          <div class="track-toolbar">
+            <span id="track-count" class="track-count">0 tracks</span>
+            <div id="track-sort-bar" class="sort-bar" role="group" aria-label="Sort and group tracks">
+              <span class="sort-label">Sort</span>
+              <button type="button" class="sort-btn active" data-sort="" title="Library order (as found on disk), flat list">Library</button>
+              <button type="button" class="sort-btn" data-sort="title" title="Sort by title, grouped A–Z (click again to reverse)">Title</button>
+              <button type="button" class="sort-btn" data-sort="artist" title="Sort by artist, one collapsible group per artist (click again to reverse)">Artist</button>
+              <button type="button" class="sort-btn" data-sort="album" title="Sort by album, one collapsible group per album (click again to reverse)">Album</button>
+              <button type="button" class="sort-btn" data-sort="genre" title="Sort by genre, one collapsible group per genre (click again to reverse)">Genre</button>
+              <button type="button" id="track-groups-toggle" class="sort-btn groups-toggle" style="display:none;" title="Collapse or expand all groups">Collapse all</button>
+            </div>
           </div>
+          <div id="library-loading" class="library-loading" style="display:none;" role="status" aria-live="polite"></div>
+          <div id="track-list" class="track-list virtual" tabindex="-1"></div>
         </div>
-        <div id="queue-card" class="queue-card empty">
-          <div id="queue-thumb" class="queue-thumb">🎵</div>
-          <div class="queue-info">
-            <div id="queue-title" class="queue-title">No song cued up</div>
-            <div id="queue-artist" class="queue-artist">Ask AI DJ: “Queue up [song]”</div>
+
+        <!-- ─── VIEW: Live Radio ─── -->
+        <div id="radio-view" class="deck-view" style="display:none;">
+          <div class="playlist-toolbar">
+            <div class="track-filter-wrap" style="flex:1; margin-bottom:0;">
+              <svg class="filter-icon" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M1.5 2.5h13l-5 5.8v4.2l-3 1.5V8.3z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+              <input type="text" id="radio-filter" class="track-filter-input" placeholder="Filter stations by name, genre, country..." />
+              <button id="radio-filter-clear" class="filter-clear-btn" style="display:none;">✕</button>
+            </div>
+            <button id="add-station-btn" class="btn-create-playlist" type="button">Find Stations…</button>
           </div>
-          <div id="queue-actions" class="queue-actions" style="display:none;">
-            <button id="queue-play-now-btn" class="queue-btn-action" title="Play next song now">▶ Play</button>
-            <button id="queue-remove-btn" class="queue-btn-action" title="Remove from queue">✕</button>
+          <div id="radio-starter-note" class="starter-note" style="display:none;">
+            <span class="starter-note-icon" aria-hidden="true">✨</span>
+            <div class="starter-note-text">
+              <b>Starter picks.</b> We pre-loaded popular stations across genres and countries so you can tune in right away.
+              Add your own with <b>Find Stations…</b>, or say <i>“Hey DJ, save a jazz station”</i>. Remove any with ✕.
+            </div>
+            <button id="radio-starter-dismiss" class="starter-note-dismiss" type="button" title="Got it">✕</button>
           </div>
+          <div id="stations-list" class="playlists-list sources-list"></div>
         </div>
-        <!-- Accordion body: the full queue, toggled by 👁 View -->
-        <div id="queue-expanded" class="queue-expanded" style="display:none;">
-          <div id="queue-tracks-container" class="track-list"></div>
-        </div>
-      </div>
 
-      <!-- ─── Deck Navigation Tabs ─── -->
-      <div class="deck-tabs">
-        <button id="tab-tracks" class="deck-tab active" type="button">
-          <span class="deck-tab-icon">🎵</span>
-          <span>Tracks</span>
-          <span id="badge-tracks-count" class="tab-badge">0</span>
-        </button>
-        <button id="tab-playlists" class="deck-tab" type="button">
-          <span class="deck-tab-icon">📑</span>
-          <span>Playlists</span>
-          <span id="badge-playlists-count" class="tab-badge">0</span>
-        </button>
-      </div>
-
-      <!-- ─── VIEW 1: All Tracks ─── -->
-      <div id="tracks-view" class="deck-view active-view">
-        <div class="track-filter-wrap">
-          <span class="search-icon">🔍</span>
-          <input type="text" id="track-filter" class="track-filter-input" placeholder="Filter tracks by title, artist, genre..." />
-          <button id="track-filter-clear" class="filter-clear-btn" style="display:none;">✕</button>
-        </div>
-        <div id="track-list" class="track-list"></div>
-      </div>
-
-      <!-- ─── VIEW 2: Playlists List ─── -->
-      <div id="playlists-view" class="deck-view" style="display:none;">
-        <div class="playlist-toolbar">
-          <div class="track-filter-wrap" style="flex:1; margin-bottom:0;">
-            <span class="search-icon">🔍</span>
-            <input type="text" id="playlist-filter" class="track-filter-input" placeholder="Filter playlists..." />
-            <button id="playlist-filter-clear" class="filter-clear-btn" style="display:none;">✕</button>
+        <!-- ─── VIEW: Podcasts ─── -->
+        <div id="podcasts-view" class="deck-view" style="display:none;">
+          <div class="playlist-toolbar">
+            <div class="track-filter-wrap" style="flex:1; margin-bottom:0;">
+              <svg class="filter-icon" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M1.5 2.5h13l-5 5.8v4.2l-3 1.5V8.3z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+              <input type="text" id="podcast-filter" class="track-filter-input" placeholder="Filter podcasts..." />
+              <button id="podcast-filter-clear" class="filter-clear-btn" style="display:none;">✕</button>
+            </div>
+            <button id="subscribe-podcast-btn" class="btn-create-playlist" type="button">Find Podcasts…</button>
           </div>
-          <button id="new-playlist-btn" class="btn-create-playlist" type="button">+ New Playlist</button>
+          <div id="podcast-starter-note" class="starter-note" style="display:none;">
+            <span class="starter-note-icon" aria-hidden="true">✨</span>
+            <div class="starter-note-text">
+              <b>Starter picks.</b> We pre-loaded a few popular shows; episodes load the first time you open or play one.
+              Add your own with <b>Find Podcasts…</b>, or say <i>“Hey DJ, subscribe to Radiolab”</i>. Unsubscribe with ✕.
+            </div>
+            <button id="podcast-starter-dismiss" class="starter-note-dismiss" type="button" title="Got it">✕</button>
+          </div>
+          <!-- Newest episodes across every subscription: play / cue the latest in one go -->
+          <div id="latest-episodes" class="playlist-card source-card latest-episodes">
+            <div class="playlist-card-header latest-episodes-header">
+              <div class="playlist-cover source-cover">🆕</div>
+              <div class="playlist-info">
+                <div class="playlist-name-row"><span class="playlist-name">Newest episodes</span><span id="latest-episodes-count" class="badge-starter">0</span></div>
+                <div class="playlist-meta" id="latest-episodes-meta">The most recent episode from each show — say “Hey DJ, play the newest episodes”.</div>
+              </div>
+              <div class="playlist-actions">
+                <button id="latest-play-btn" class="playlist-btn-play" type="button" title="Play the newest episode now and cue the rest">▶ Play</button>
+                <button id="latest-cue-btn" class="playlist-btn-cue" type="button" title="Cue all newest episodes">+ Cue</button>
+                <button id="latest-view-btn" class="view-toggle-btn" type="button" aria-expanded="false" title="Show the newest episodes"><span class="chevron2"></span></button>
+              </div>
+            </div>
+            <div id="latest-episodes-body" class="playlist-expanded">
+              <div class="playlist-expanded-inner">
+                <div id="latest-episodes-list" class="track-list podcast-episodes"></div>
+              </div>
+            </div>
+          </div>
+          <div id="podcasts-list" class="playlists-list sources-list"></div>
         </div>
-        <div id="playlists-list" class="playlists-list"></div>
-      </div>
 
+        <!-- ─── VIEW: Audiobooks (local files from AUDIOBOOKS_DIR) ─── -->
+        <div id="audiobooks-view" class="deck-view" style="display:none;">
+          <div class="playlist-toolbar">
+            <div class="track-filter-wrap" style="flex:1; margin-bottom:0;">
+              <svg class="filter-icon" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M1.5 2.5h13l-5 5.8v4.2l-3 1.5V8.3z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+              <input type="text" id="audiobook-filter" class="track-filter-input" placeholder="Filter audiobooks by title, author, narrator..." />
+              <button id="audiobook-filter-clear" class="filter-clear-btn" style="display:none;">✕</button>
+            </div>
+            <button id="audiobooks-rescan-btn" class="btn-create-playlist" type="button" title="Scan the audiobook folder again">↻ Rescan</button>
+          </div>
+          <div id="audiobooks-setup-note" class="starter-note setup-note" style="display:none;">
+            <span class="starter-note-icon" aria-hidden="true">📖</span>
+            <div class="starter-note-text" id="audiobooks-setup-text">
+              <b>Audiobooks are not set up yet.</b> Add <code>AUDIOBOOKS_DIR=C:\path\to\Audiobooks</code> to <code>backend/.env</code> and restart the server.
+              Each book is a folder of chapter files (or a single <code>.m4b</code>/<code>.mp3</code>); <code>Author/Book/…</code> and <code>CD 1</code>/<code>CD 2</code> sub-folders are understood.
+            </div>
+          </div>
+          <div id="audiobooks-list" class="playlists-list sources-list"></div>
+        </div>
 
-    </div>
+        <!-- ─── VIEW: Streaming (online sources, one sub-section per provider) ─── -->
+        <div id="streaming-view" class="deck-view" style="display:none;">
+          <div class="playlist-toolbar streaming-search-row">
+            <div class="track-filter-wrap" style="flex:1; margin-bottom:0;">
+              <span class="search-icon">🔍</span>
+              <input type="text" id="streaming-search-input" class="track-filter-input" placeholder="Search songs, albums, artists across the streaming sources…" />
+              <button id="streaming-search-clear" class="filter-clear-btn" style="display:none;">✕</button>
+            </div>
+            <button id="streaming-search-btn" class="btn-create-playlist" type="button">Search</button>
+          </div>
+          <div id="streaming-sections" class="playlists-list sources-list streaming-sections"></div>
+        </div>
+      </section>
 
+    </main>
   </div>
 
   <!-- ─── MODAL: Add to Playlist ─── -->
@@ -193,6 +355,48 @@
     </div>
   </div>
 
+  <!-- ─── MODAL: Confirm / Alert (shared by every destructive or informational dialog) ─── -->
+  <div id="confirm-modal" class="modal-backdrop" style="display:none;" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+    <div class="modal-card modal-card-narrow">
+      <div class="modal-header">
+        <h3 id="confirm-title">Are you sure?</h3>
+        <button id="confirm-close-btn" class="modal-close-btn" aria-label="Close">✕</button>
+      </div>
+      <div class="modal-body">
+        <p id="confirm-message" class="modal-desc"></p>
+        <div class="modal-actions-row">
+          <button id="confirm-cancel-btn" class="modal-btn-cancel">Cancel</button>
+          <button id="confirm-ok-btn" class="modal-btn-confirm">OK</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── MODAL: New Playlist ─── -->
+  <div id="new-playlist-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>New Playlist</h3>
+        <button id="new-playlist-close-btn" class="modal-close-btn">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-form-group">
+          <label for="new-playlist-name-input">Playlist Name</label>
+          <input type="text" id="new-playlist-name-input" class="modal-input" placeholder="e.g. Road Trip" maxlength="80" />
+        </div>
+        <div class="modal-form-group">
+          <label for="new-playlist-desc-input">Description (optional)</label>
+          <input type="text" id="new-playlist-desc-input" class="modal-input" placeholder="e.g. Windows-down summer drives" maxlength="200" />
+        </div>
+        <p class="modal-desc">Add songs afterwards with <b>+ 📑</b> on any track, or say <i>“Hey DJ, add this song to Road Trip”</i>.</p>
+        <div class="modal-actions-row">
+          <button id="new-playlist-cancel-btn" class="modal-btn-cancel">Cancel</button>
+          <button id="new-playlist-confirm-btn" class="modal-btn-confirm">Create Playlist</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ─── MODAL: Save Queue as Playlist ─── -->
   <div id="save-queue-modal" class="modal-backdrop" style="display:none;">
     <div class="modal-card">
@@ -210,6 +414,72 @@
           <button id="save-queue-cancel-btn" class="modal-btn-cancel">Cancel</button>
           <button id="save-queue-confirm-btn" class="modal-btn-confirm">Save Playlist</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── MODAL: Find Radio Stations ─── -->
+  <div id="add-station-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal-card modal-card-wide">
+      <div class="modal-header">
+        <h3>Find Radio Stations</h3>
+        <button id="station-modal-close-btn" class="modal-close-btn">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-create-row">
+          <input type="text" id="station-search-input" class="modal-input" placeholder="Search thousands of stations by name or genre…" />
+          <button id="station-search-btn" class="modal-btn-confirm">Search</button>
+        </div>
+        <div class="modal-create-row modal-create-row-secondary">
+          <input type="text" id="station-place-input" class="modal-input" placeholder="City or region (optional), e.g. Halifax" title="Only stations that mention this city/region — or leave the search box empty to browse a city's stations" />
+          <input type="text" id="station-country-input" class="modal-input modal-input-narrow" placeholder="Country (optional)" title="Narrow the search to one country, e.g. Canada" />
+        </div>
+        <div class="directory-note">Results come from the community directory and TuneIn. <span class="badge-unverified">unverified</span> means the directory's checkers couldn't reach the stream recently — often just geo-blocking; such stations usually play fine locally.</div>
+        <div id="station-browse-chips" class="chip-row" aria-label="Browse by genre"></div>
+        <div id="station-search-results" class="modal-playlists-list directory-results"></div>
+        <details class="modal-details">
+          <summary>Add a station by stream URL</summary>
+          <div class="modal-form-group">
+            <label>Station Name</label>
+            <input type="text" id="station-name-input" class="modal-input" placeholder="e.g. My Local FM" />
+          </div>
+          <div class="modal-form-group">
+            <label>Stream URL</label>
+            <input type="url" id="station-url-input" class="modal-input" placeholder="https://…/stream.mp3 (MP3/AAC/OGG, .pls or .m3u)" />
+          </div>
+          <div class="modal-form-group">
+            <label>Genre (optional)</label>
+            <input type="text" id="station-genre-input" class="modal-input" placeholder="e.g. Jazz, News" />
+          </div>
+          <div class="modal-actions-row">
+            <button id="station-add-btn" class="modal-btn-confirm">Add Station</button>
+          </div>
+        </details>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── MODAL: Subscribe to Podcast ─── -->
+  <div id="add-podcast-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal-card modal-card-wide">
+      <div class="modal-header">
+        <h3>Subscribe to a Podcast</h3>
+        <button id="podcast-modal-close-btn" class="modal-close-btn">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-create-row">
+          <input type="text" id="podcast-search-input" class="modal-input" placeholder="Search podcasts by name…" />
+          <button id="podcast-search-btn" class="modal-btn-confirm">Search</button>
+        </div>
+        <div id="podcast-browse-chips" class="chip-row" aria-label="Browse by category"></div>
+        <div id="podcast-search-results" class="modal-playlists-list directory-results"></div>
+        <details class="modal-details">
+          <summary>Subscribe with an RSS feed URL</summary>
+          <div class="modal-create-row">
+            <input type="url" id="podcast-feed-input" class="modal-input" placeholder="https://example.com/feed.xml" />
+            <button id="podcast-subscribe-btn" class="modal-btn-confirm">Subscribe</button>
+          </div>
+        </details>
       </div>
     </div>
   </div>

@@ -1,5 +1,74 @@
 /**
- * AI DJ — Frontend (V6.8)
+ * AI DJ — Frontend (V7.6)
+ *
+ * V7.6: "Library" tab is "Music"; Playlists moved into the player column
+ *       under the cue; the cue grows to the room available (summary card
+ *       hides while open) and ▶ on a cued row plays it without dropping the
+ *       rows above. Drag & drop: Music rows/groups, playlist rows and
+ *       Streaming results onto the cue or a playlist card; reorder within
+ *       the cue and playlists. Draggable, snapping tab carousel. Newest
+ *       podcast episodes card (+ voice tools). Finder buttons relabelled,
+ *       funnel icons on filters, audiobooks sorted by recency.
+ *
+ * V7.5: The streaming tab is now "Streaming": online sources as sub-sections
+ *       — YouTube Music (third-party ytmusicapi + yt-dlp on the server) first,
+ *       then Apple Music and Deezer previews. Everything is relayed through
+ *       the deck; there is no embedded third-party player any more. Sections
+ *       page with "More results"; only headers carry the "Previews" label.
+ *       Browse tabs are a horizontal carousel (‹ › buttons, active tab kept
+ *       centred) in a Browse column as wide as the player. Playlist rows lost
+ *       the "From here" button. Source type 'stream'.
+ *
+ * V7.4: Library Expand/Collapse-all no longer resets the sort (the button
+ *       shared .sort-btn with the sort keys) and keeps the viewed group in
+ *       place. A finished streamed clip continues the queue or stops — never
+ *       the local library.
+ *
+ * V7.3: Fix round. Loading message with scan progress while the server reads
+ *       tags (polls /api/tracks instead of giving up; socket connects first;
+ *       everything else loads in parallel). Queue "Play now" always visible.
+ *       Audiobook card / chapter buttons turn into ⏸ Pause while playing.
+ *       Transport controls are fixed circles that wrap instead of squashing.
+ *
+ * V7.2: Two new sources. AUDIOBOOKS: an Audiobooks tab lists the books found
+ *       in AUDIOBOOKS_DIR (cover, author, narrator, length, progress), expands
+ *       to chapters, resumes where you left off (progress is kept on the
+ *       server so the DJ can "continue my book"), auto-advances chapters and
+ *       reuses the podcast skip/speed controls and the episode panel.
+ *       STREAMING tab (first version). New server commands
+ *       playAudiobookChapter, playStreamTracks, queueStreamTracks.
+ *       Protocol v5.
+ *
+ * V7.1: Polish pass. Finder modals no longer close on a backdrop click;
+ *       New Playlist is a modal (name + optional description) instead of
+ *       prompt(); "+ Cue" on playlist cards, podcast cards and episode rows —
+ *       the queue now holds podcast episodes next to songs; Up Next is
+ *       expanded by default; list rows select on click / play on ▶ or
+ *       double-click (Library, Radio, playlist tracks, episodes); all
+ *       expand/collapse controls are chevrons; station search tolerates
+ *       spacing/word order ("Move100", "96.5 the breeze").
+ *
+ * V7.0: Layout overhaul. Compact top bar (brand · DJ status readout · Live
+ *       toggle · volume) instead of a half-screen DJ panel; the deck splits
+ *       into a NOW PLAYING column and a BROWSE column with one tab per source
+ *       (Library, Playlists, Radio, Podcasts — registry-driven so future
+ *       sources are one entry + one tab). Fixed artwork tile with a kind badge
+ *       replaces the spinning disc. Podcast episode panel (number • date •
+ *       length • time left, expandable show notes). Starter picks: stations
+ *       and podcasts pre-loaded on first run, badged, with a dismissable note
+ *       explaining how to add more (GUI and voice). Station finder browses
+ *       the directory by genre chips / top stations as well as search.
+ *
+ * V6.9: Live radio & podcasts. New Radio / Podcasts deck tabs (saved
+ *       stations with directory search, podcast subscriptions with episode
+ *       lists, resume positions and ↺15 / 30↻ skip buttons). The deck plays a
+ *       "source" (radio station or podcast episode) through the same <audio>
+ *       element via same-origin backend relays, so ducking and the visualiser
+ *       keep working. Radio shows a LIVE badge, the station's on-air song
+ *       title (ICY metadata polled from the server) and stop/re-tune instead
+ *       of pause/resume. playback_state reports the active `source`; new
+ *       server commands playRadio, playPodcastEpisode, seekRelative,
+ *       radioStationsChanged, podcastsChanged. Protocol v4.
  *
  * V6.8: Ready jingle (synthesised, autoplay-safe). Salient active-playlist
  *       cues: now-playing pill (green / amber one-off), NOW PLAYING card pill
@@ -37,11 +106,31 @@
  *      Voice PCM arriving while listening also auto-drops properly.
  */
 
+import {
+  SKIP_BACK_S, SKIP_FWD_S, RADIO_NOW_POLL_MS, PODCAST_CATEGORIES, STATION_GENRES_FALLBACK, BOOK_PROGRESS_SAVE_MS,
+  describeSource, sourceKind, buildSourcePayload, formatClock, formatDuration, formatEpisodeDate,
+  episodeMetaLine, remainingLabel, shouldShowStarterNote,
+  resumePositionFor, rememberPosition, loadPositions, savePositions, episodeProgress,
+  filterStations, filterPodcasts, filterAudiobooks, withCacheBuster, clampSeek,
+  chapterMetaLine, bookProgressLabel, resumePointFor, nextChapter, previousChapter, sortAudiobooks,
+  STREAM_PROVIDERS, STREAM_PROVIDER_ORDER, providerName, streamPlayable, streamMetaLine, streamQueueItem, formatMs,
+} from './sources.js';
+
+const STARTER_NOTE_KEY = 'aidj.starterNoteDismissed';   // { radio: true, podcast: true }
+
+/** Drag-and-drop MIME types (HTML5 DnD): what a dragged row carries. */
+const DND = {
+  TRACKS: 'application/x-aidj-tracks',     // {trackIds: [...], label} — library rows/groups, playlist rows -> cue / playlists
+  STREAM: 'application/x-aidj-stream',     // {track} — a Streaming result -> cue
+  QUEUE: 'application/x-aidj-queue',       // "<index>" — reorder within the cue
+  PLTRACK: 'application/x-aidj-pltrack',   // {playlistId, trackId} — reorder within a playlist
+};
+
 // ==========================================
 // CONFIGURATION
 // ==========================================
 const CONFIG = {
-  PROTOCOL_VERSION: 3,
+  PROTOCOL_VERSION: 5,
   WS_RECONNECT_BASE_MS: 1000,
   WS_RECONNECT_MAX_MS: 30000,
   WS_HEARTBEAT_INTERVAL_MS: 30000,
@@ -56,6 +145,8 @@ const CONFIG = {
   // Mic open with no DJ response for this long = nobody is talking; end the
   // session rather than leave an open mic streaming room noise to Gemini.
   LISTEN_TIMEOUT_MS: 15000,
+  // Keep polling /api/tracks (503 = still scanning) up to this long.
+  LIBRARY_LOAD_TIMEOUT_MS: 30 * 60 * 1000,
 };
 
 // ==========================================
@@ -679,192 +770,370 @@ class LiveSocket extends EventTarget {
 }
 
 // ==========================================
-// TRACK LIST RENDERER (Keyed Diff)
+// TRACK LIST RENDERER (virtualised + sortable)
 // ==========================================
+/**
+ * Renders the Library as a windowed list: only the rows inside the scroll
+ * viewport (plus a small overscan) exist in the DOM, so a 10k-track library
+ * costs the same as a 30-track one. Rows are pooled and re-filled on scroll.
+ * Row height is fixed (CSS .track-list.virtual .track-item) so positions are
+ * arithmetic. Supports filter text and sort key/direction.
+ */
 class TrackListRenderer {
-  constructor(container) {
+  constructor(container, { rowHeight = 52, overscan = 6 } = {}) {
     this.container = container;
-    this.items = new Map();
+    this.rowHeight = rowHeight;
+    this.overscan = overscan;
+    this.tracks = [];
+    this.visible = [];            // [{ track, originalIndex }] after filter + sort
     this.currentId = null;
-    this.lastRenderedQuery = null;
-    this.lastTrackCount = 0;
+    this.selectedId = null;
+    this.filterQuery = '';
+    this.sortKey = '';            // '' = library order
+    this.sortDir = 1;
+    this.trackPool = [];          // recycled track rows
+    this.groupPool = [];          // recycled group header rows
+    this.expanded = new Set();    // expanded group keys (groups start collapsed)
+    this.groups = [];             // [{ key, label, count }] for the current sort
+    this.onCountChange = null;    // (visibleCount, totalCount, groupCount) => void
+    this.onDragStart = null;      // (dragEvent, tracks[], label) => void — rows/groups are draggable to the cue and playlists
+    this._rafPending = false;
 
-    this.container.addEventListener('click', (e) => {
-      const plBtn = e.target.closest('.track-add-playlist-btn');
-      if (plBtn) {
-        e.stopPropagation();
-        const item = plBtn.closest('.track-item');
-        const index = parseInt(item?.dataset.index, 10);
-        if (!isNaN(index) && window.djApp?.tracks[index]) {
-          window.djApp.openAddToPlaylistModal(window.djApp.tracks[index]);
-        }
+    this.container.classList.add('virtual');
+    this.spacer = document.createElement('div');
+    this.spacer.className = 'vlist-spacer';
+    this.rows = document.createElement('div');
+    this.rows.className = 'vlist-rows';
+    this.empty = document.createElement('div');
+    this.empty.className = 'sources-empty';
+    this.empty.style.display = 'none';
+    this.container.replaceChildren(this.spacer, this.rows, this.empty);
+
+    this.container.addEventListener('scroll', () => this._scheduleDraw(), { passive: true });
+    window.addEventListener('resize', () => this._scheduleDraw());
+    // The Library tab can be hidden (display:none → 0px tall) when data
+    // arrives; redraw as soon as it gets a real size.
+    if (typeof ResizeObserver !== 'undefined') {
+      new ResizeObserver(() => this._scheduleDraw()).observe(this.container);
+    }
+
+    // Delegated row interaction: ▶ / + Cue / + 📑 buttons, click = select,
+    // double-click or Enter = play.
+    this.rows.addEventListener('click', (e) => {
+      const group = e.target.closest('.track-group');
+      if (group) {
+        const key = group.dataset.groupKey;
+        const tracks = this.groups.find(g => g.key === key)?.tracks || [];
+        if (e.target.closest('.group-play-btn')) { e.stopPropagation(); window.djApp?.playTracks(tracks); return; }
+        if (e.target.closest('.group-cue-btn')) { e.stopPropagation(); window.djApp?.queueTracks(tracks); return; }
+        this.toggleGroup(key);
         return;
       }
-      const cueBtn = e.target.closest('.track-cue-btn');
-      if (cueBtn) {
-        e.stopPropagation();
-        const item = cueBtn.closest('.track-item');
-        const index = parseInt(item?.dataset.index, 10);
-        if (!isNaN(index) && window.djApp?.tracks[index]) {
-          window.djApp.queueTrackById(window.djApp.tracks[index].id);
-        }
-        return;
-      }
-      const item = e.target.closest('.track-item');
-      if (!item) return;
-      const index = parseInt(item.dataset.index, 10);
+      const row = e.target.closest('.track-item');
+      if (!row) return;
+      const index = parseInt(row.dataset.index, 10);
+      const track = window.djApp?.tracks[index];
+      if (!track) return;
+      if (e.target.closest('.track-add-playlist-btn')) { e.stopPropagation(); window.djApp.openAddToPlaylistModal(track); return; }
+      if (e.target.closest('.track-cue-btn')) { e.stopPropagation(); window.djApp.queueTrackById(track.id); return; }
+      if (e.target.closest('.track-play-btn')) { e.stopPropagation(); window.djApp.playTrackByIndex(index); return; }
+      this.setSelected(this.selectedId === track.id ? null : track.id);
+    });
+    this.rows.addEventListener('dblclick', (e) => {
+      if (e.target.closest('button')) return;
+      const index = parseInt(e.target.closest('.track-item')?.dataset.index, 10);
       if (!isNaN(index)) window.djApp?.playTrackByIndex(index);
+    });
+    this.rows.addEventListener('keydown', (e) => {
+      const group = e.target.closest('.track-group');
+      if (group && e.target === group && (e.key === 'Enter' || e.key === ' ')) {
+        e.preventDefault();
+        this.toggleGroup(group.dataset.groupKey);
+        return;
+      }
+      const row = e.target.closest('.track-item');
+      if (!row || e.target !== row) return;
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        const index = parseInt(row.dataset.index, 10);
+        if (!isNaN(index)) window.djApp?.playTrackByIndex(index);
+      } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const pos = parseInt(row.dataset.pos, 10) + (e.key === 'ArrowDown' ? 1 : -1);
+        this.focusPosition(pos);
+      }
     });
   }
 
+  /** Main entry point (kept compatible with earlier callers). */
   render(tracks, currentId, filterQuery = '') {
-    const prevId = this.currentId;
+    const q = (filterQuery || '').toLowerCase().trim();
+    const changed = tracks !== this.tracks || q !== this.filterQuery || this._dirty;
+    this.tracks = tracks;
+    this.filterQuery = q;
     this.currentId = currentId;
-    const q = filterQuery.toLowerCase().trim();
+    if (changed) {
+      this._dirty = false;
+      this._recompute();
+    }
+    this._draw();
+  }
 
-    // Fast path: if track list length and filter query haven't changed,
-    // ONLY toggle the active class without touching the DOM tree or resetting scroll position!
-    if (this.lastRenderedQuery === q && this.lastTrackCount === tracks.length) {
-      if (prevId !== currentId) {
-        if (prevId != null && this.items.has(prevId)) {
-          const prevEl = this.items.get(prevId);
-          prevEl.classList.remove('track-active');
-          prevEl.querySelector('.track-num')?.classList.remove('track-num-active');
+  setSort(key, dir) {
+    if (key === this.sortKey && dir === undefined) {
+      this.sortDir = -this.sortDir;           // same key again: flip direction
+    } else {
+      this.sortKey = key || '';
+      this.sortDir = dir || 1;
+      this.expanded.clear();                  // groups belong to a sort key; start collapsed
+    }
+    this._dirty = true;
+    this.container.scrollTop = 0;
+    this.render(this.tracks, this.currentId, this.filterQuery);
+  }
+
+  /** Redraw without recomputing (e.g. the tab just became visible). */
+  refresh() {
+    this._scheduleDraw();
+  }
+
+  /** Grouping follows the sort: letters for Title, values for Artist/Album/Genre. */
+  get groupMode() {
+    return this.sortKey || '';
+  }
+
+  get allCollapsed() {
+    return this.groups.length > 0 && !this.groups.some(g => this.expanded.has(g.key));
+  }
+
+  toggleGroup(key) {
+    const anchor = this._scrollAnchor();
+    if (this.expanded.has(key)) this.expanded.delete(key);
+    else this.expanded.add(key);
+    this._dirty = true;
+    this.render(this.tracks, this.currentId, this.filterQuery);
+    this._restoreScrollAnchor(anchor);
+  }
+
+  /**
+   * Expand/collapse every group while keeping the group the user is looking
+   * at where it is (instead of jumping back to the top of the list).
+   */
+  toggleAllGroups() {
+    const anchor = this._scrollAnchor();
+    if (this.allCollapsed) this.groups.forEach(g => this.expanded.add(g.key));
+    else this.expanded.clear();
+    this._dirty = true;
+    this.render(this.tracks, this.currentId, this.filterQuery);
+    this._restoreScrollAnchor(anchor);
+  }
+
+  /** The group whose header/track is at the top of the viewport, and how far below the top it sits. */
+  _scrollAnchor() {
+    if (!this.groupMode || !this.visible.length) return null;
+    const idx = Math.min(this.visible.length - 1, Math.max(0, Math.floor(this.container.scrollTop / this.rowHeight)));
+    const entry = this.visible[idx];
+    const key = entry.type === 'group' ? entry.group.key : this._groupKeyFor(entry.track);
+    return { key, offset: this.container.scrollTop - idx * this.rowHeight };
+  }
+
+  _restoreScrollAnchor(anchor) {
+    if (!anchor) return;
+    const idx = this.visible.findIndex(e => e.type === 'group' && e.group.key === anchor.key);
+    if (idx === -1) return;
+    this.container.scrollTop = Math.max(0, idx * this.rowHeight + Math.min(anchor.offset, this.rowHeight - 1));
+    this._scheduleDraw();
+  }
+
+  _groupKeyFor(track) {
+    const mode = this.groupMode;
+    if (mode === 'title') {
+      const ch = (track.title || '').trim().charAt(0).toUpperCase();
+      return /[A-Z]/.test(ch) ? ch : (/[0-9]/.test(ch) ? '0–9' : '#');
+    }
+    const v = (track[mode] || '').trim();
+    return v || `(No ${mode})`;
+  }
+
+  setSelected(trackId) {
+    this.selectedId = trackId;
+    this._draw();
+  }
+
+  /** Scroll so the given track (by id) is in view. */
+  scrollToTrack(trackId) {
+    const pos = this.visible.findIndex(v => v.type === 'track' && v.track.id === trackId);
+    if (pos < 0) return;
+    const top = pos * this.rowHeight;
+    const { scrollTop, clientHeight } = this.container;
+    if (top < scrollTop || top + this.rowHeight > scrollTop + clientHeight) {
+      this.container.scrollTop = Math.max(0, top - clientHeight / 2 + this.rowHeight / 2);
+    }
+  }
+
+  focusPosition(pos) {
+    if (pos < 0 || pos >= this.visible.length) return;
+    const top = pos * this.rowHeight;
+    const { scrollTop, clientHeight } = this.container;
+    if (top < scrollTop) this.container.scrollTop = top;
+    else if (top + this.rowHeight > scrollTop + clientHeight) this.container.scrollTop = top + this.rowHeight - clientHeight;
+    this._draw();
+    this.rows.querySelector(`.track-item[data-pos="${pos}"]`)?.focus();
+  }
+
+  _recompute() {
+    const q = this.filterQuery;
+    let list = this.tracks.map((track, originalIndex) => ({ track, originalIndex }));
+    if (q) {
+      list = list.filter(({ track }) =>
+        track.title.toLowerCase().includes(q) ||
+        track.artist.toLowerCase().includes(q) ||
+        (track.genre || '').toLowerCase().includes(q) ||
+        (track.album || '').toLowerCase().includes(q));
+    }
+    const trackCount = list.length;
+    if (this.sortKey) {
+      const key = this.sortKey, dir = this.sortDir;
+      const collator = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true });
+      list.sort((a, b) => {
+        const c = collator.compare(a.track[key] || '', b.track[key] || '');
+        return c !== 0 ? c * dir : collator.compare(a.track.title, b.track.title);
+      });
+    }
+
+    // Hierarchy: one header per group (in sort order); collapsed groups hide their tracks.
+    this.groups = [];
+    if (this.groupMode) {
+      const items = [];
+      let current = null;
+      for (const entry of list) {
+        const key = this._groupKeyFor(entry.track);
+        if (!current || current.key !== key) {
+          current = { key, label: key, count: 0, tracks: [] };
+          this.groups.push(current);
+          items.push({ type: 'group', group: current });
         }
-        if (currentId != null && this.items.has(currentId)) {
-          const currEl = this.items.get(currentId);
-          currEl.classList.add('track-active');
-          currEl.querySelector('.track-num')?.classList.add('track-num-active');
-        }
+        current.count++;
+        current.tracks.push(entry.track);
+        if (this.expanded.has(key)) items.push({ type: 'track', ...entry });
       }
-      return;
+      list = items;
+    } else {
+      list = list.map(entry => ({ type: 'track', ...entry }));
     }
 
-    this.lastRenderedQuery = q;
-    this.lastTrackCount = tracks.length;
+    this.visible = list;
+    this.spacer.style.height = `${list.length * this.rowHeight}px`;
+    // While the server is still scanning, the loading banner speaks instead.
+    this.empty.style.display = list.length || this.loading ? 'none' : '';
+    this.empty.textContent = this.tracks.length === 0
+      ? 'No tracks found in your music folder (MUSIC_DIR).'
+      : 'No matching tracks.';
+    if (this.onCountChange) this.onCountChange(trackCount, this.tracks.length, this.groups.length);
+  }
 
-    const visibleTracks = q
-      ? tracks
-          .map((track, originalIndex) => ({ track, originalIndex }))
-          .filter(({ track }) =>
-            track.title.toLowerCase().includes(q) ||
-            track.artist.toLowerCase().includes(q) ||
-            track.genre.toLowerCase().includes(q) ||
-            (track.album && track.album.toLowerCase().includes(q))
-          )
-      : tracks.map((track, originalIndex) => ({ track, originalIndex }));
+  _scheduleDraw() {
+    if (this._rafPending) return;
+    this._rafPending = true;
+    requestAnimationFrame(() => { this._rafPending = false; this._draw(); });
+  }
 
-    const trackIds = new Set(visibleTracks.map(item => item.track.id));
+  _draw() {
+    const total = this.visible.length;
+    const viewport = this.container.clientHeight || 400;
+    const first = Math.max(0, Math.floor(this.container.scrollTop / this.rowHeight) - this.overscan);
+    const count = Math.max(0, Math.min(total - first, Math.ceil(viewport / this.rowHeight) + this.overscan * 2));
+    this.rows.style.transform = `translateY(${first * this.rowHeight}px)`;
 
-    for (const [id, el] of this.items) {
-      if (!trackIds.has(id)) {
-        el.remove();
-        this.items.delete(id);
+    // Fill the window from two element pools (track rows / group headers) in order.
+    const children = [];
+    let t = 0, g = 0;
+    for (let i = 0; i < count; i++) {
+      const item = this.visible[first + i];
+      if (item.type === 'group') {
+        const el = this.groupPool[g] || (this.groupPool[g] = this._createGroupElement());
+        g++;
+        this._updateGroupElement(el, item.group, first + i);
+        children.push(el);
+      } else {
+        const el = this.trackPool[t] || (this.trackPool[t] = this._createElement());
+        t++;
+        this._updateElement(el, item.track, item.originalIndex, first + i);
+        children.push(el);
       }
     }
+    this.trackPool.length = Math.max(t, Math.min(this.trackPool.length, 60));
+    this.groupPool.length = Math.max(g, Math.min(this.groupPool.length, 30));
+    this.rows.replaceChildren(...children);
+  }
 
-    if (visibleTracks.length === 0) {
-      this.container.innerHTML = '<div style="padding:20px; opacity:0.5; font-size:12px; text-align:center;">No matching tracks found</div>';
-      return;
-    }
-
-    const frag = document.createDocumentFragment();
-    visibleTracks.forEach(({ track, originalIndex }) => {
-      let el = this.items.get(track.id);
-      if (!el) {
-        el = this._createElement();
-        this.items.set(track.id, el);
-      }
-      this._updateElement(el, track, originalIndex);
-      frag.appendChild(el);
+  _createGroupElement() {
+    const el = document.createElement('div');
+    el.className = 'track-group';
+    el.tabIndex = 0;
+    el.draggable = true;
+    el.addEventListener('dragstart', (e) => {
+      const group = this.groups.find(g => g.key === el.dataset.groupKey);
+      if (group && this.onDragStart) this.onDragStart(e, group.tracks, `${group.label} (${group.count} tracks)`);
+      else e.preventDefault();
     });
+    el.innerHTML = `
+      <span class="track-group-label"></span>
+      <span class="track-group-count"></span>
+      <button class="track-play-btn group-play-btn" title="Play this group (first track now, the rest cued)">▶ Play</button>
+      <button class="track-cue-btn group-cue-btn" title="Cue every track in this group">+ Cue</button>
+      <span class="view-toggle-btn group-toggle" aria-hidden="true"><span class="chevron2"></span></span>
+    `;
+    return el;
+  }
 
-    this.container.replaceChildren(frag);
+  _updateGroupElement(el, group, pos) {
+    const open = this.expanded.has(group.key);
+    el.dataset.groupKey = group.key;
+    el.dataset.pos = pos;
+    el.classList.toggle('open', open);
+    el.setAttribute('aria-expanded', String(open));
+    el.querySelector('.group-toggle').classList.toggle('open', open);
+    el.querySelector('.track-group-label').textContent = group.label;
+    el.querySelector('.track-group-count').textContent = `${group.count} track${group.count === 1 ? '' : 's'}`;
+    el.title = `${open ? 'Collapse' : 'Expand'} ${group.label}`;
   }
 
   _createElement() {
     const el = document.createElement('div');
     el.className = 'track-item';
+    el.tabIndex = 0;
+    el.draggable = true;
+    el.addEventListener('dragstart', (e) => {
+      const track = this.tracks[parseInt(el.dataset.index, 10)];
+      if (track && this.onDragStart) this.onDragStart(e, [track], track.title);
+      else e.preventDefault();
+    });
     el.innerHTML = `
-      <div class="track-num"></div>
+      <span class="track-lead eq-bars" aria-hidden="true"><i></i><i></i><i></i></span>
       <div class="track-info">
         <div class="track-title"></div>
         <div class="track-artist"></div>
       </div>
       <div class="track-genre"></div>
+      <button class="track-play-btn" title="Play now">▶</button>
       <button class="track-add-playlist-btn" title="Add to playlist">+ 📑</button>
       <button class="track-cue-btn" title="Cue up to play next">+ Cue</button>
     `;
     return el;
   }
 
-  _updateElement(el, track, index) {
+  _updateElement(el, track, index, pos) {
     const isActive = track.id === this.currentId;
     el.dataset.index = index;
+    el.dataset.pos = pos;
     el.classList.toggle('track-active', isActive);
-
-    const num = el.querySelector('.track-num');
-    num.textContent = String(index + 1).padStart(2, '0');
-    num.classList.toggle('track-num-active', isActive);
-
+    el.classList.toggle('track-selected', track.id === this.selectedId);
     el.querySelector('.track-title').textContent = track.title;
-    el.querySelector('.track-artist').textContent = track.artist;
-    el.querySelector('.track-genre').textContent = track.genre;
+    el.querySelector('.track-artist').textContent = track.album ? `${track.artist} • ${track.album}` : track.artist;
+    el.querySelector('.track-genre').textContent = track.genre || '';
+    el.title = `${track.title} — ${track.artist}`;
   }
-}
-
-// ==========================================
-// VISUALIZER
-// ==========================================
-class Visualizer {
-  constructor(canvas, analyser) {
-    this.canvas = canvas;
-    this.ctx = canvas.getContext('2d');
-    this.analyser = analyser;
-    this.running = true;
-    this._resize();
-    window.addEventListener('resize', () => this._resize());
-  }
-
-  _resize() {
-    this.canvas.width = window.innerWidth;
-    this.canvas.height = window.innerHeight;
-  }
-
-  start() {
-    this.running = true;
-    this._draw();
-  }
-
-  stop() {
-    this.running = false;
-  }
-
-  _draw = () => {
-    if (!this.running) return;
-    requestAnimationFrame(this._draw);
-
-    if (!this.analyser || document.hidden) return;
-
-    const bufferLength = this.analyser.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
-    this.analyser.getByteFrequencyData(dataArray);
-
-    const { width, height } = this.canvas;
-    this.ctx.clearRect(0, 0, width, height);
-
-    // Focus on audible frequencies (first 96 bins) and span the entire canvas evenly
-    const activeBins = Math.min(bufferLength, 96);
-    const barWidth = width / activeBins;
-
-    for (let i = 0; i < activeBins; i++) {
-      const val = dataArray[i];
-      const barHeight = (val / 255) * (height * 0.45);
-      const opacity = (val / 255) * 0.6 + 0.08;
-      this.ctx.fillStyle = `rgba(155, 114, 203, ${opacity})`;
-      this.ctx.fillRect(i * barWidth, height - barHeight, Math.max(1, barWidth - 1), barHeight);
-    }
-  };
 }
 
 // ==========================================
@@ -878,7 +1147,7 @@ class AIDJApp {
     this.activePlaylist = null;
     this.currentView = 'tracks';
     this.expandedPlaylist = null;   // full playlist (with tracks) currently expanded in the accordion
-    this.queueExpanded = false;
+    this.queueExpanded = true;       // Up Next shows the full list by default
     this.playlistFilterQuery = '';
     this.targetTrackForPlaylist = null;
     this.toastPlaylistId = null;
@@ -887,13 +1156,114 @@ class AIDJApp {
     this.isPlaying = false;
     this.userVolume = 1.0;
     this.serverReady = false;
+    this.libraryLoading = null;      // { phase, found, read } while the server scans the music folder
+
+    // Live radio & podcasts. `source` is null while the local deck plays;
+    // otherwise { type:'radio', station, origin } or { type:'podcast', podcast, episode }.
+    this.source = null;
+    this.stations = [];
+    this.podcasts = [];
+    this.expandedPodcast = null;     // full podcast (with episodes) expanded in the Podcasts tab
+    this.radioFilterQuery = '';
+    this.podcastFilterQuery = '';
+    this.radioNowTitle = '';         // on-air song title from ICY metadata
+    this.radioNowTimer = null;
+    this.radioReconnectTimer = null;
+    this.podcastPositions = loadPositions(window.localStorage);
+    this.lastPositionSaveMs = 0;
+    this.starterDismissed = this._loadStarterDismissed();
+    this.stationGenres = STATION_GENRES_FALLBACK;   // replaced by the server's list on first browse
+    this.episodeNotesExpanded = false;
+    this.podcastRepollTimer = null;
+    this.podcastSpeed = this._loadPodcastSpeed();
+    this._confirmResolve = null;
+
+    // Audiobooks (local files from AUDIOBOOKS_DIR; progress lives on the server)
+    this.audiobooks = [];
+    this.audiobooksInfo = { configured: true, directoryExists: true, scanning: false };
+    this.expandedAudiobook = null;   // full book (with chapters) expanded in the Audiobooks tab
+    this.audiobookFilterQuery = '';
+    this.lastBookProgressSaveMs = 0;
+
+    // Streaming tab: provider availability (/api/streaming/status) and the last search, per provider
+    this.streamingStatus = null;     // { providers: [{id, name, available, reason, full}], ... }
+    this.streamingResults = null;    // { query, results: [{provider, tracks, albums, error}] }
+    this.streamingQuery = '';
+    this.streamingBusy = false;
+    this.streamingCollapsed = {};    // provider id -> true when its section is folded
 
     this.dom = {
       musicPlayer: $('music-player'),
+      nowPlayingSource: $('now-playing-source'),
+      nowThumb: $('now-thumb'),
+      nowThumbKind: $('now-thumb-kind'),
+      nowThumbPlaying: $('now-thumb-playing'),
+      episodePanel: $('episode-panel'),
+      episodeMeta: $('episode-meta'),
+      episodeRemaining: $('episode-remaining'),
+      episodeNotes: $('episode-notes'),
+      episodeNotesToggle: $('episode-notes-toggle'),
+      radioStarterNote: $('radio-starter-note'),
+      radioStarterDismiss: $('radio-starter-dismiss'),
+      podcastStarterNote: $('podcast-starter-note'),
+      podcastStarterDismiss: $('podcast-starter-dismiss'),
+      stationBrowseChips: $('station-browse-chips'),
+      podcastBrowseChips: $('podcast-browse-chips'),
+      episodePanelLabel: $('episode-panel-label'),
+      deckTabs: $('deck-tabs'),
+      tabsPrevBtn: $('tabs-prev-btn'),
+      tabsNextBtn: $('tabs-next-btn'),
+      tabAudiobooks: $('tab-audiobooks'),
+      tabStreaming: $('tab-streaming'),
+      badgeAudiobooksCount: $('badge-audiobooks-count'),
+      badgeStreamingCount: $('badge-streaming-count'),
+      audiobooksView: $('audiobooks-view'),
+      streamingView: $('streaming-view'),
+      audiobookFilter: $('audiobook-filter'),
+      audiobookFilterClear: $('audiobook-filter-clear'),
+      audiobooksRescanBtn: $('audiobooks-rescan-btn'),
+      audiobooksSetupNote: $('audiobooks-setup-note'),
+      audiobooksSetupText: $('audiobooks-setup-text'),
+      audiobooksList: $('audiobooks-list'),
+      streamingSearchInput: $('streaming-search-input'),
+      streamingSearchClear: $('streaming-search-clear'),
+      streamingSearchBtn: $('streaming-search-btn'),
+      streamingSections: $('streaming-sections'),
+      skipBackBtn: $('skip-back-btn'),
+      skipFwdBtn: $('skip-fwd-btn'),
+      tabRadio: $('tab-radio'),
+      tabPodcasts: $('tab-podcasts'),
+      badgeRadioCount: $('badge-radio-count'),
+      badgePodcastsCount: $('badge-podcasts-count'),
+      radioView: $('radio-view'),
+      podcastsView: $('podcasts-view'),
+      radioFilter: $('radio-filter'),
+      radioFilterClear: $('radio-filter-clear'),
+      addStationBtn: $('add-station-btn'),
+      stationsList: $('stations-list'),
+      podcastFilter: $('podcast-filter'),
+      podcastFilterClear: $('podcast-filter-clear'),
+      subscribePodcastBtn: $('subscribe-podcast-btn'),
+      podcastsList: $('podcasts-list'),
+      addStationModal: $('add-station-modal'),
+      stationModalCloseBtn: $('station-modal-close-btn'),
+      stationSearchInput: $('station-search-input'),
+      stationSearchBtn: $('station-search-btn'),
+      stationSearchResults: $('station-search-results'),
+      stationNameInput: $('station-name-input'),
+      stationUrlInput: $('station-url-input'),
+      stationGenreInput: $('station-genre-input'),
+      stationAddBtn: $('station-add-btn'),
+      addPodcastModal: $('add-podcast-modal'),
+      podcastModalCloseBtn: $('podcast-modal-close-btn'),
+      podcastSearchInput: $('podcast-search-input'),
+      podcastSearchBtn: $('podcast-search-btn'),
+      podcastSearchResults: $('podcast-search-results'),
+      podcastFeedInput: $('podcast-feed-input'),
+      podcastSubscribeBtn: $('podcast-subscribe-btn'),
       liveBtn: $('live-btn'),
       liveBtnIcon: $('live-btn-icon'),
       liveBtnText: $('live-btn-text'),
-      liveBtnLabel: $('live-btn-label'),
       statusBadge: $('status-badge'),
       statusDot: $('status-dot'),
       statusText: $('status-text'),
@@ -901,7 +1271,6 @@ class AIDJApp {
       nowPlayingTitle: $('now-playing-title'),
       nowPlayingArtist: $('now-playing-artist'),
       nowPlayingPlaylist: $('now-playing-playlist'),
-      discIcon: $('disc-icon'),
       playPauseBtn: $('play-pause-btn'),
       playPauseIcon: $('play-pause-icon'),
       prevBtn: $('prev-btn'),
@@ -920,7 +1289,6 @@ class AIDJApp {
       aiCountdownText: $('ai-countdown-text'),
       trackFilter: $('track-filter'),
       trackFilterClear: $('track-filter-clear'),
-      canvas: $('visualizer'),
       queueContainer: $('queue-container'),
       queueCount: $('queue-count'),
       queueClearBtn: $('queue-clear-btn'),
@@ -936,11 +1304,20 @@ class AIDJApp {
       queueExpanded: $('queue-expanded'),
       queueTracksContainer: $('queue-tracks-container'),
       tabTracks: $('tab-tracks'),
-      tabPlaylists: $('tab-playlists'),
+      playlistsSection: $('playlists-section'),
+      playlistsBody: $('playlists-body'),
+      playlistsCount: $('playlists-count'),
+      playlistsViewBtn: $('playlists-view-btn'),
+      latestEpisodes: $('latest-episodes'),
+      latestEpisodesCount: $('latest-episodes-count'),
+      latestEpisodesMeta: $('latest-episodes-meta'),
+      latestPlayBtn: $('latest-play-btn'),
+      latestCueBtn: $('latest-cue-btn'),
+      latestViewBtn: $('latest-view-btn'),
+      latestEpisodesBody: $('latest-episodes-body'),
+      latestEpisodesList: $('latest-episodes-list'),
       badgeTracksCount: $('badge-tracks-count'),
-      badgePlaylistsCount: $('badge-playlists-count'),
       tracksView: $('tracks-view'),
-      playlistsView: $('playlists-view'),
       playlistFilter: $('playlist-filter'),
       playlistFilterClear: $('playlist-filter-clear'),
       newPlaylistBtn: $('new-playlist-btn'),
@@ -956,6 +1333,26 @@ class AIDJApp {
       modalPlaylistsList: $('modal-playlists-list'),
       modalNewPlName: $('modal-new-pl-name'),
       modalCreatePlBtn: $('modal-create-pl-btn'),
+      trackCount: $('track-count'),
+      libraryLoading: $('library-loading'),
+      trackSortBar: $('track-sort-bar'),
+      speedControl: $('speed-control'),
+      speedSelect: $('speed-select'),
+      trackGroupsToggle: $('track-groups-toggle'),
+      stationCountryInput: $('station-country-input'),
+      stationPlaceInput: $('station-place-input'),
+      confirmModal: $('confirm-modal'),
+      confirmTitle: $('confirm-title'),
+      confirmMessage: $('confirm-message'),
+      confirmCloseBtn: $('confirm-close-btn'),
+      confirmCancelBtn: $('confirm-cancel-btn'),
+      confirmOkBtn: $('confirm-ok-btn'),
+      newPlaylistModal: $('new-playlist-modal'),
+      newPlaylistCloseBtn: $('new-playlist-close-btn'),
+      newPlaylistNameInput: $('new-playlist-name-input'),
+      newPlaylistDescInput: $('new-playlist-desc-input'),
+      newPlaylistCancelBtn: $('new-playlist-cancel-btn'),
+      newPlaylistConfirmBtn: $('new-playlist-confirm-btn'),
       saveQueueModal: $('save-queue-modal'),
       saveQueueCloseBtn: $('save-queue-close-btn'),
       saveQueueNameInput: $('save-queue-name-input'),
@@ -968,7 +1365,6 @@ class AIDJApp {
     this.wakeWord = new WakeWordListener();
     this.socket = new LiveSocket(this._wsUrl(), CONFIG.PROTOCOL_VERSION);
     this.trackRenderer = new TrackListRenderer(this.dom.trackList);
-    this.visualizer = new Visualizer(this.dom.canvas, this.audio.analyser);
 
     this.fsm = new SessionFSM();
     this.sessionTimer = null;
@@ -997,15 +1393,27 @@ class AIDJApp {
 
   async init() {
     console.log('[App] Initializing AI DJ...');
-    this.visualizer.start();
-    await this._loadTracks();
-    await this.loadPlaylists();
-    this._setAiState('offline', 'Waiting to connect');
-    this._updateUI();
-    this._updateQueueUI();
+    const t0 = performance.now();
+    this._setAiState('offline', 'Loading…');
     this._setupGesturePrewarm();
-    this.socket.connect();
-    console.log('[App] Init complete');
+    this.socket.connect();                   // don't make the DJ wait for the library
+    this._updateUI();
+    this._updateSortBar();
+    this._updateQueueUI();
+    // Everything loads in parallel; the library shows its own scan progress
+    // (the server starts serving before the scan is done).
+    await Promise.all([
+      this._loadTracks(),
+      this.loadPlaylists(),
+      this.loadStations(),
+      this.loadPodcasts(),
+      this.loadAudiobooks(),
+      this.loadStreamingStatus(),
+    ]);
+    this._updateUI();
+    this._updateSortBar();
+    this._updateTabArrows();
+    console.log(`[App] Init complete in ${Math.round(performance.now() - t0)}ms`);
   }
 
   _wsUrl() {
@@ -1013,26 +1421,75 @@ class AIDJApp {
     return `${protocol}//${location.host}/ws/live`;
   }
 
+  /**
+   * Load the library. While the server is still scanning it answers 503 with
+   * progress ({phase, found, read}); keep polling and show that progress
+   * instead of giving up after a few tries.
+   */
   async _loadTracks() {
-    const maxRetries = 5;
-    for (let i = 0; i < maxRetries; i++) {
+    this.libraryLoading = { phase: 'connecting', found: 0, read: 0 };
+    this._renderLibraryLoading();
+    const deadline = Date.now() + CONFIG.LIBRARY_LOAD_TIMEOUT_MS;
+    let delay = 400;
+    while (Date.now() < deadline) {
       try {
         const res = await fetch('/api/tracks');
         if (res.status === 200) {
           this.tracks = await res.json();
+          this.libraryLoading = null;
+          this._renderLibraryLoading();
+          this._updatePlaylistBadges();
+          this._updateUI();
           console.log(`[App] Loaded ${this.tracks.length} tracks`);
           return;
         }
+        if (res.status === 503) {
+          const info = await res.json().catch(() => ({}));
+          this.libraryLoading = { phase: info.phase || 'scanning', found: info.found || 0, read: info.read || 0, elapsed: info.elapsed };
+          this._renderLibraryLoading();
+        }
       } catch (e) {
-        console.error(`[App] Track load attempt ${i + 1} failed:`, e);
+        this.libraryLoading = { phase: 'connecting', found: 0, read: 0 };
+        this._renderLibraryLoading();
       }
-      await new Promise(r => setTimeout(r, 1000));
+      await new Promise(r => setTimeout(r, delay));
+      delay = Math.min(1500, delay + 200);
     }
-    console.error('[App] Failed to load tracks after retries');
+    this.libraryLoading = { phase: 'failed', found: 0, read: 0 };
+    this._renderLibraryLoading();
+    console.error('[App] Library did not finish loading in time');
+  }
+
+  /** Loading message in the Library tab + the track count while the server scans. */
+  _renderLibraryLoading() {
+    const el = this.dom.libraryLoading;
+    const st = this.libraryLoading;
+    const loading = !!st && st.phase !== 'failed';
+    if (this.trackRenderer.loading !== loading) {
+      this.trackRenderer.loading = loading;
+      this.trackRenderer._dirty = true;                                       // force _recompute (same track array)
+      this.trackRenderer.render(this.tracks, null, this.trackFilterQuery);   // re-evaluates the empty-state text
+    }
+    if (!el) return;
+    if (!st) { el.style.display = 'none'; return; }
+    el.style.display = 'flex';
+    const n = (x) => (x || 0).toLocaleString();
+    let text;
+    if (st.phase === 'connecting') text = 'Connecting to the AI DJ server…';
+    else if (st.phase === 'failed') text = 'The library did not load. Is the server running? Reload the page to try again.';
+    else if (st.phase === 'listing' || !st.found) text = 'Scanning your music folder…';
+    else text = `Reading track tags… ${n(st.read)} of ${n(st.found)} files${st.elapsed ? ` (${Math.round(st.elapsed)}s)` : ''}`;
+    const pct = st.found ? Math.round((st.read / st.found) * 100) : 0;
+    el.innerHTML = `<span class="library-loading-icon" aria-hidden="true">${st.phase === 'failed' ? '⚠️' : '⏳'}</span>`
+      + `<div class="library-loading-text"><b>${st.phase === 'failed' ? 'Library unavailable' : 'Loading your library'}</b><span>${escapeHtml(text)}</span>`
+      + (st.found && st.phase !== 'failed' ? `<div class="episode-progress library-progress"><i style="width:${pct}%"></i></div>` : '')
+      + '</div>';
+    if (this.dom.trackCount) this.dom.trackCount.textContent = st.phase === 'failed' ? 'Library unavailable' : 'Scanning…';
   }
 
   _bindEvents() {
-    this.dom.musicPlayer.addEventListener('ended', () => this.nextTrack());
+    this.dom.musicPlayer.addEventListener('ended', () => this._onMediaEnded());
+    this.dom.musicPlayer.addEventListener('error', () => this._onMediaError());
     this.dom.musicPlayer.addEventListener('play', () => {
       this.isPlaying = true;
       this._sendPlaybackState();
@@ -1040,6 +1497,8 @@ class AIDJApp {
     });
     this.dom.musicPlayer.addEventListener('pause', () => {
       this.isPlaying = false;
+      if (this.source?.type === 'podcast') this._rememberEpisodePosition(true);
+      if (this.source?.type === 'audiobook') this._saveBookProgress(true);
       this._sendPlaybackState();
       this._updateUI();
     });
@@ -1061,17 +1520,18 @@ class AIDJApp {
     });
 
     this.dom.volumeSlider.addEventListener('input', throttle(() => {
-      this.userVolume = parseFloat(this.dom.volumeSlider.value);
-      if (this.audio._musicSource) {
-        this.audio.setVolume(this.userVolume, { ducked: this._shouldDuck() });
-      } else {
-        this.dom.musicPlayer.volume = this.userVolume;
-      }
+      this.setUserVolume(parseFloat(this.dom.volumeSlider.value), { fromSlider: true });
     }, CONFIG.VOLUME_THROTTLE_MS));
+    this.dom.volumeSlider.addEventListener('change', () => this._sendPlaybackState());
 
     this.dom.playPauseBtn.addEventListener('click', () => this.togglePlayPause());
     this.dom.prevBtn.addEventListener('click', () => this.prevTrack());
     this.dom.nextBtn.addEventListener('click', () => this.nextTrack());
+    this.dom.skipBackBtn?.addEventListener('click', () => this.seekRelative(-SKIP_BACK_S));
+    this.dom.skipFwdBtn?.addEventListener('click', () => this.seekRelative(SKIP_FWD_S));
+    this.dom.episodeNotesToggle?.addEventListener('click', () => this.toggleEpisodeNotes());
+    this.dom.radioStarterDismiss?.addEventListener('click', () => this.dismissStarterNote('radio'));
+    this.dom.podcastStarterDismiss?.addEventListener('click', () => this.dismissStarterNote('podcast'));
 
     this.dom.queueClearBtn?.addEventListener('click', () => this.clearQueue());
     this.dom.queuePlayNowBtn?.addEventListener('click', () => this.playNextInQueue());
@@ -1081,7 +1541,53 @@ class AIDJApp {
 
     // --- Tab Switching ---
     this.dom.tabTracks?.addEventListener('click', () => this.switchView('tracks'));
-    this.dom.tabPlaylists?.addEventListener('click', () => this.switchView('playlists'));
+    this.dom.playlistsViewBtn?.addEventListener('click', () => this.togglePlaylistsSection());
+    // Newest podcast episodes workflow
+    this.dom.latestPlayBtn?.addEventListener('click', (e) => { e.stopPropagation(); this.playLatestEpisodes(); });
+    this.dom.latestCueBtn?.addEventListener('click', (e) => { e.stopPropagation(); this.playLatestEpisodes({ queueOnly: true }); });
+    this.dom.latestViewBtn?.addEventListener('click', (e) => { e.stopPropagation(); this.toggleLatestEpisodes(); });
+    this.dom.latestEpisodes?.querySelector('.latest-episodes-header')?.addEventListener('click', () => this.toggleLatestEpisodes());
+    this.dom.latestEpisodesBody?.addEventListener('click', (e) => e.stopPropagation());
+    this.dom.tabRadio?.addEventListener('click', () => this.switchView('radio'));
+    this.dom.tabPodcasts?.addEventListener('click', () => this.switchView('podcasts'));
+    this.dom.tabAudiobooks?.addEventListener('click', () => this.switchView('audiobooks'));
+    this.dom.tabStreaming?.addEventListener('click', () => this.switchView('streaming'));
+    // Tab carousel arrows
+    this.dom.tabsPrevBtn?.addEventListener('click', () => this._scrollTabs(-1));
+    this.dom.tabsNextBtn?.addEventListener('click', () => this._scrollTabs(1));
+    this.dom.deckTabs?.addEventListener('scroll', () => this._updateTabArrows(), { passive: true });
+    window.addEventListener('resize', () => { this._updateTabArrows(); this._revealActiveTab(); });
+
+    // --- Audiobooks tab: filter, rescan ---
+    this._bindFilter(this.dom.audiobookFilter, this.dom.audiobookFilterClear, (q) => { this.audiobookFilterQuery = q; this.renderAudiobooks(); });
+    this.dom.audiobooksRescanBtn?.addEventListener('click', () => this.rescanAudiobooks());
+
+    // --- Streaming tab: one search across every provider section ---
+    this._bindFilter(this.dom.streamingSearchInput, this.dom.streamingSearchClear, (q) => {
+      this.streamingQuery = q;
+      if (!q) { this.streamingResults = null; this.renderStreaming(); }
+    });
+    this.dom.streamingSearchBtn?.addEventListener('click', () => this.searchStreaming());
+    this.dom.streamingSearchInput?.addEventListener('keydown', (e) => { if (e.key === 'Enter') this.searchStreaming(); });
+
+    // --- Radio tab: filter, add-station modal (directory search or stream URL) ---
+    this._bindFilter(this.dom.radioFilter, this.dom.radioFilterClear, (q) => { this.radioFilterQuery = q; this.renderStations(); });
+    this.dom.addStationBtn?.addEventListener('click', () => this.openAddStationModal());
+    // Finder modals hold search results and half-typed URLs: close only via ✕.
+    this.dom.stationModalCloseBtn?.addEventListener('click', () => this.closeAddStationModal());
+    this.dom.stationSearchBtn?.addEventListener('click', () => this.searchStationDirectory());
+    this.dom.stationSearchInput?.addEventListener('keydown', (e) => { if (e.key === 'Enter') this.searchStationDirectory(); });
+    this.dom.stationCountryInput?.addEventListener('keydown', (e) => { if (e.key === 'Enter') this.searchStationDirectory(); });
+    this.dom.stationPlaceInput?.addEventListener('keydown', (e) => { if (e.key === 'Enter') this.searchStationDirectory(); });
+    this.dom.stationAddBtn?.addEventListener('click', () => this.submitManualStation());
+
+    // --- Podcasts tab: filter, subscribe modal (directory search or feed URL) ---
+    this._bindFilter(this.dom.podcastFilter, this.dom.podcastFilterClear, (q) => { this.podcastFilterQuery = q; this.renderPodcasts(); });
+    this.dom.subscribePodcastBtn?.addEventListener('click', () => this.openAddPodcastModal());
+    this.dom.podcastModalCloseBtn?.addEventListener('click', () => this.closeAddPodcastModal());
+    this.dom.podcastSearchBtn?.addEventListener('click', () => this.searchPodcastDirectory());
+    this.dom.podcastSearchInput?.addEventListener('keydown', (e) => { if (e.key === 'Enter') this.searchPodcastDirectory(); });
+    this.dom.podcastSubscribeBtn?.addEventListener('click', () => this.submitFeedSubscription());
 
     // --- Playlist Toolbar & Filter ---
     this.dom.newPlaylistBtn?.addEventListener('click', () => this.openCreatePlaylistModal());
@@ -1105,16 +1611,64 @@ class AIDJApp {
     // --- Modal: Add To Playlist ---
     this.dom.modalCloseBtn?.addEventListener('click', () => this.closeAddToPlaylistModal());
     this.dom.modalCreatePlBtn?.addEventListener('click', () => this.submitModalCreateAndAdd());
-    this.dom.addToPlaylistModal?.addEventListener('click', (e) => {
-      if (e.target === this.dom.addToPlaylistModal) this.closeAddToPlaylistModal();
-    });
+
+    // --- Modal: New Playlist ---
+    this.dom.newPlaylistCloseBtn?.addEventListener('click', () => this.closeCreatePlaylistModal());
+    this.dom.newPlaylistCancelBtn?.addEventListener('click', () => this.closeCreatePlaylistModal());
+    this.dom.newPlaylistConfirmBtn?.addEventListener('click', () => this.submitCreatePlaylist());
+    this.dom.newPlaylistNameInput?.addEventListener('keydown', (e) => { if (e.key === 'Enter') this.submitCreatePlaylist(); });
+    this.dom.newPlaylistDescInput?.addEventListener('keydown', (e) => { if (e.key === 'Enter') this.submitCreatePlaylist(); });
 
     // --- Modal: Save Queue ---
     this.dom.saveQueueCloseBtn?.addEventListener('click', () => this.closeSaveQueueModal());
     this.dom.saveQueueCancelBtn?.addEventListener('click', () => this.closeSaveQueueModal());
     this.dom.saveQueueConfirmBtn?.addEventListener('click', () => this.submitSaveQueue());
-    this.dom.saveQueueModal?.addEventListener('click', (e) => {
-      if (e.target === this.dom.saveQueueModal) this.closeSaveQueueModal();
+
+    // --- Modal: Confirm / Alert (shared) ---
+    this.dom.confirmCloseBtn?.addEventListener('click', () => this._resolveConfirm(false));
+    this.dom.confirmCancelBtn?.addEventListener('click', () => this._resolveConfirm(false));
+    this.dom.confirmOkBtn?.addEventListener('click', () => this._resolveConfirm(true));
+
+    // Every modal: Esc closes it; a backdrop click never does (consistent, no
+    // accidental loss of search results or typed text).
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      const open = [...document.querySelectorAll('.modal-backdrop')].filter(m => m.style.display !== 'none').pop();
+      if (!open) return;
+      e.preventDefault();
+      if (open === this.dom.confirmModal) this._resolveConfirm(false);
+      else open.style.display = 'none';
+    });
+
+    // --- Library sort bar ---
+    this.dom.trackSortBar?.addEventListener('click', (e) => {
+      // Only the sort keys — the Expand/Collapse-all button shares the
+      // .sort-btn look but must not reset the sort to "Library".
+      const btn = e.target.closest('.sort-btn[data-sort]');
+      if (!btn) return;
+      this.trackRenderer.setSort(btn.dataset.sort);
+      this._updateSortBar();
+    });
+    this.trackRenderer.onDragStart = (e, tracks, label) => this._startTracksDrag(e, tracks, label);
+    this._makeQueueDropTarget();
+    this._makeTabsDraggable();
+    this.trackRenderer.onCountChange = (visible, total, groups) => {
+      if (!this.dom.trackCount) return;
+      const fmt = (n) => n.toLocaleString();
+      const base = visible === total
+        ? `${fmt(total)} track${total === 1 ? '' : 's'}`
+        : `${fmt(visible)} of ${fmt(total)} tracks`;
+      const mode = this.trackRenderer.groupMode;
+      const noun = mode === 'title' ? 'letter' : mode;
+      this.dom.trackCount.textContent = groups ? `${base} in ${fmt(groups)} ${noun}${groups === 1 ? '' : 's'}` : base;
+      this._updateSortBar();
+    };
+
+    // --- Playback speed (podcasts) ---
+    this.dom.speedSelect?.addEventListener('change', (e) => this.setPlaybackSpeed(parseFloat(e.target.value)));
+    this.dom.trackGroupsToggle?.addEventListener('click', () => {
+      this.trackRenderer.toggleAllGroups();
+      this._updateSortBar();
     });
 
     this.dom.trackFilter?.addEventListener('input', (e) => {
@@ -1619,14 +2173,52 @@ class AIDJApp {
         this.queueTrackById(msg.trackId);
         break;
       case 'pausePlayback':
+        if (this.source?.type === 'radio') { this.stopRadio(); break; }
         this.dom.musicPlayer.pause();
         this.isPlaying = false;
         this._updateUI();
         break;
       case 'resumePlayback':
+        if (this.source?.type === 'radio') { this.playStation(this.source.station, { origin: this.source.origin }); break; }
         this.dom.musicPlayer.play().catch(console.error);
         this.isPlaying = true;
         this._updateUI();
+        break;
+      case 'playAudiobookChapter':
+        this.playChapter(msg.book, msg.chapter, { position: Number(msg.position) || 0 });
+        break;
+      case 'playStreamTracks':
+        this.playStreamTracks(msg.tracks || [], msg.context || null);
+        break;
+      case 'queueStreamTracks':
+        (msg.tracks || []).forEach(t => this.queueStreamTrack(t, msg.context || null, { silent: true }));
+        if ((msg.tracks || []).length) this.showPlaylistToast('➕ Cued from streaming', msg.tracks.map(t => t.title).slice(0, 2).join(', ') + (msg.tracks.length > 2 ? ` +${msg.tracks.length - 2}` : ''), null);
+        break;
+      case 'playRadio':
+        this.playStation(msg.station, { origin: msg.origin || 'saved' });
+        break;
+      case 'playPodcastEpisode':
+        this.playEpisode(msg.podcast, msg.episode);
+        break;
+      case 'queuePodcastEpisodes':
+        (msg.items || []).forEach(it => this.queueEpisode(it.podcast, it.episode, { silent: true }));
+        if ((msg.items || []).length) this.showPlaylistToast('➕ Cued episodes', `${msg.items.length} newest episode${msg.items.length === 1 ? '' : 's'}`, null);
+        break;
+      case 'seekRelative':
+        this.seekRelative(Number(msg.seconds) || 0);
+        break;
+      case 'setPlaybackRate':
+        this.setPlaybackSpeed(Number(msg.rate) || 1);
+        break;
+      case 'setVolume':
+        this.setUserVolume(Number(msg.level));
+        this.showPlaylistToast('🔊 Volume', `${Math.round(this.userVolume * 100)}%`, null);
+        break;
+      case 'radioStationsChanged':
+        this.handleRadioStationsChanged(msg).catch(err => console.error('[App] radioStationsChanged failed:', err));
+        break;
+      case 'podcastsChanged':
+        this.handlePodcastsChanged(msg).catch(err => console.error('[App] podcastsChanged failed:', err));
         break;
       case 'nextTrack':
         this.nextTrack();
@@ -1670,6 +2262,7 @@ class AIDJApp {
   async playTrackByIndex(index) {
     if (index < 0 || index >= this.tracks.length) return;
 
+    this._leaveSource();
     this.currentTrackIndex = index;
     const track = this.tracks[index];
 
@@ -1696,22 +2289,9 @@ class AIDJApp {
 
     this.dom.musicPlayer.src = `/api/tracks/${track.id}/stream`;
 
-    // Image fallback probe — restore emoji disc if 404 or image fails to load
+    // Artwork tile: probe first so a 404 falls back to the emoji, not a broken image
     const artUrl = `/api/tracks/${track.id}/art`;
-    const testImg = new Image();
-    testImg.onload = () => {
-      if (this.currentTrackIndex === index) {
-        this.dom.discIcon.style.backgroundImage = `url('${artUrl}')`;
-        this.dom.discIcon.textContent = '';
-      }
-    };
-    testImg.onerror = () => {
-      if (this.currentTrackIndex === index) {
-        this.dom.discIcon.style.backgroundImage = 'none';
-        this.dom.discIcon.textContent = '💿';
-      }
-    };
-    testImg.src = artUrl;
+    this._setThumbArt(artUrl, '💿', () => !this.source && this.currentTrackIndex === index);
 
     if ('mediaSession' in navigator) {
       navigator.mediaSession.metadata = new MediaMetadata({
@@ -1722,6 +2302,7 @@ class AIDJApp {
     }
 
     const t0 = performance.now();
+    this._applyPlaybackRate();             // music is always 1×
     this.dom.musicPlayer.play()
       .then(() => {
         this._endToolTimer(track.id || 'play', t0);
@@ -1744,6 +2325,12 @@ class AIDJApp {
     if (this.audio.ctx.state === 'suspended') {
       await this.audio.ctx.resume();
     }
+    if (this.source?.type === 'radio') {
+      // Live radio: "pause" drops the stream; "play" re-tunes to the live edge.
+      if (this.isPlaying) this.stopRadio();
+      else this.playStation(this.source.station, { origin: this.source.origin });
+      return;
+    }
     if (this.isPlaying) {
       this.dom.musicPlayer.pause();
       this.isPlaying = false;
@@ -1755,8 +2342,19 @@ class AIDJApp {
   }
 
   nextTrack() {
+    if (this.source?.type === 'audiobook' && this.queue.length === 0) {
+      const next = nextChapter(this.source.book, this.source.chapter.id);
+      if (next) { this.playChapter(this.source.book, next); return; }
+    }
     if (this.queue.length > 0) {
       this.playNextInQueue();
+      return;
+    }
+    if (this.source) {
+      // Leaving radio/podcast: continue the library from where the deck was.
+      this._leaveSource();
+      if (this.tracks.length === 0) { this._updateUI(); this._sendPlaybackState(); return; }
+      this.playTrackByIndex(this.currentTrackIndex < 0 ? 0 : (this.currentTrackIndex + 1) % this.tracks.length);
       return;
     }
     if (this.activePlaylist) {
@@ -1764,7 +2362,7 @@ class AIDJApp {
       console.log(`[App] Playlist '${this.activePlaylist.name}' finished`);
       this.activePlaylist = null;
       this._sendPlaybackState();
-      if (this.currentView === 'playlists') this.renderPlaylists();
+      this.renderPlaylists();
     }
     if (this.tracks.length === 0) return;
     this.playTrackByIndex((this.currentTrackIndex + 1) % this.tracks.length);
@@ -1803,13 +2401,72 @@ class AIDJApp {
 
   playNextInQueue() {
     if (this.queue.length === 0) return;
-    const nextTrk = this.queue.shift();
+    const next = this.queue.shift();
     this._updateQueueUI();
-    this.playTrackById(nextTrk.id);
+    this._playQueueItem(next);
+  }
+
+  /** Queue entries are library tracks or podcast episodes ({kind:'podcast'}). */
+  _playQueueItem(item) {
+    if (!item) return;
+    if (item.kind === 'podcast') this.playEpisode(item.podcast, item.episode);
+    else if (item.kind === 'stream') this.playStreamTrack(item.track, { context: item.context || null });
+    else if (item.kind === 'audiobook') this.playChapter(item.book, item.chapter);
+    else this.playTrackById(item.id);
+  }
+
+  /** "+ Cue" for a podcast episode: queued next to songs, played in order. */
+  queueEpisode(podcast, episode, { silent = false } = {}) {
+    if (!podcast?.id || !episode?.id) return;
+    if (this.queue.some(q => q.id === episode.id)) {
+      if (!silent) this.showPlaylistToast('🎙 Already cued', episode.title, null);
+      return;
+    }
+    this.queue.push({
+      id: episode.id, title: episode.title, artist: podcast.title, genre: 'Podcast',
+      kind: 'podcast', podcast: { id: podcast.id, title: podcast.title, artworkUrl: podcast.artworkUrl || '' }, episode,
+    });
+    this._updateQueueUI();
+    this._sendPlaybackState();
+    if (!silent) this.showPlaylistToast('➕ Cued episode', `${episode.title} • ${podcast.title}`, null);
+  }
+
+  async cueLatestEpisode(podcastId) {
+    try {
+      const pod = await this._fetchPodcastLoaded(podcastId);
+      const ep = (pod?.episodes || [])[0];
+      if (!ep) {
+        this.showPlaylistToast('🎙 No episodes', pod?.refreshError || 'No playable episodes yet', null);
+        return;
+      }
+      this.queueEpisode(pod, ep);
+    } catch (e) {
+      console.error('[App] Cue latest episode error:', e);
+    }
+  }
+
+  /**
+   * A playlist is only "active" while it still has something to play: the
+   * current song or cued songs that belong to it. Clearing or editing the
+   * queue can end that, which also retires the "one-off song" status line.
+   */
+  _reconcileActivePlaylist() {
+    const pl = this.activePlaylist;
+    if (!pl) return false;
+    const ids = pl.trackIds || (pl.tracks || []).map(t => t.id);
+    const current = !this.source && this.currentTrackIndex >= 0 ? this.tracks[this.currentTrackIndex] : null;
+    const currentIn = !!current && (ids.length === 0 || ids.includes(current.id));
+    const queuedIn = ids.length ? this.queue.some(q => q.kind !== 'podcast' && ids.includes(q.id)) : this.queue.some(q => q.kind !== 'podcast');
+    if (currentIn || queuedIn) return false;
+    console.log(`[App] Playlist '${pl.name}' is no longer active (nothing of it is playing or cued)`);
+    this.activePlaylist = null;
+    this.renderPlaylists();
+    return true;
   }
 
   _updateQueueUI() {
     if (!this.dom.queueContainer) return;
+    if (this._reconcileActivePlaylist()) this._updateUI();
     const hasItems = this.queue.length > 0;
     const nextTrack = hasItems ? this.queue[0] : null;
 
@@ -1829,21 +2486,30 @@ class AIDJApp {
       this.dom.queueTitle.textContent = nextTrack.title;
       this.dom.queueArtist.textContent = nextTrack.artist;
 
-      const artUrl = `/api/tracks/${nextTrack.id}/art`;
-      const testImg = new Image();
-      testImg.onload = () => {
-        if (this.queue.length > 0 && this.queue[0].id === nextTrack.id) {
-          this.dom.queueThumb.style.backgroundImage = `url('${artUrl}')`;
-          this.dom.queueThumb.textContent = '';
-        }
-      };
-      testImg.onerror = () => {
-        if (this.queue.length > 0 && this.queue[0].id === nextTrack.id) {
-          this.dom.queueThumb.style.backgroundImage = 'none';
-          this.dom.queueThumb.textContent = '🎵';
-        }
-      };
-      testImg.src = artUrl;
+      const kindIcons = { podcast: '🎙', stream: '🌐', audiobook: '📖' };
+      const artUrl = nextTrack.kind === 'podcast' ? (nextTrack.podcast?.artworkUrl || '')
+        : nextTrack.kind === 'stream' ? (nextTrack.track?.albumArt || '')
+          : nextTrack.kind === 'audiobook' ? (nextTrack.book?.id ? `/api/audiobooks/${nextTrack.book.id}/art` : '')
+            : `/api/tracks/${nextTrack.id}/art`;
+      const fallback = kindIcons[nextTrack.kind] || '🎵';
+      this.dom.queueThumb.style.backgroundImage = 'none';
+      this.dom.queueThumb.textContent = fallback;
+      if (artUrl) {
+        const testImg = new Image();
+        testImg.onload = () => {
+          if (this.queue.length > 0 && this.queue[0].id === nextTrack.id) {
+            this.dom.queueThumb.style.backgroundImage = `url('${artUrl}')`;
+            this.dom.queueThumb.textContent = '';
+          }
+        };
+        testImg.onerror = () => {
+          if (this.queue.length > 0 && this.queue[0].id === nextTrack.id) {
+            this.dom.queueThumb.style.backgroundImage = 'none';
+            this.dom.queueThumb.textContent = fallback;
+          }
+        };
+        testImg.src = artUrl;
+      }
 
       this.dom.queueActions.style.display = 'flex';
     } else {
@@ -1859,7 +2525,18 @@ class AIDJApp {
   }
 
   prevTrack() {
+    if (this.source?.type === 'audiobook') {
+      // Early in a chapter: previous chapter; otherwise restart this one (like a CD player).
+      const prev = this.dom.musicPlayer.currentTime < 5 ? previousChapter(this.source.book, this.source.chapter.id) : null;
+      this.playChapter(this.source.book, prev || this.source.chapter);
+      return;
+    }
     if (this.tracks.length === 0) return;
+    if (this.source) {
+      this._leaveSource();
+      this.playTrackByIndex(this.currentTrackIndex < 0 ? 0 : this.currentTrackIndex);
+      return;
+    }
     this.playTrackByIndex(
       this.currentTrackIndex <= 0 ? this.tracks.length - 1 : this.currentTrackIndex - 1
     );
@@ -1871,39 +2548,81 @@ class AIDJApp {
     const isLive = this.fsm.state !== 'offline';
     const isListening = this.fsm.state === 'listening';
 
-    if (isLive) {
-      // ON AIR: one look for every live sub-state (connecting, listening,
-      // thinking, speaking). Mic/DJ status lives in the Live DJ panel, not
-      // on the button, so the button is strictly Talk Live <-> End Live.
-      this.dom.liveBtn.className = 'live-btn live-btn-active';
-      this.dom.liveBtnIcon.textContent = '⏹';
-      this.dom.liveBtnText.textContent = 'End Live';
-      this.dom.liveBtn.setAttribute('aria-pressed', 'true');
-      this.dom.liveBtnLabel.textContent = isListening
-        ? 'Listening — just talk. Press End Live to stop.'
-        : 'AI DJ is live. Press End Live to stop.';
-    } else {
-      // OFF AIR: the button starts a live session with the mic open.
-      this.dom.liveBtn.className = 'live-btn';
-      this.dom.liveBtnIcon.textContent = '🎙️';
-      this.dom.liveBtnText.textContent = 'Talk Live';
-      this.dom.liveBtn.setAttribute('aria-pressed', 'false');
-      this.dom.liveBtnLabel.textContent = this.serverReady
-        ? 'Press Talk Live and just speak. (“Hey DJ” works too.)'
-        : 'Preparing AI DJ…';
+    // The Live switch is strictly two-state: ON (any live sub-state) / OFF.
+    // Sub-state (listening, thinking, speaking…) is shown by the readout.
+    this.dom.liveBtn.className = 'live-toggle' + (isLive ? ' on' : '');
+    this.dom.liveBtnIcon.textContent = isLive ? '🔴' : '🎙️';
+    this.dom.liveBtnText.textContent = isLive ? 'On Air' : 'Go Live';
+    this.dom.liveBtn.setAttribute('aria-checked', String(isLive));
+    this.dom.liveBtn.title = isLive
+      ? (isListening ? 'Listening — just talk. Click to end Live mode.' : 'AI DJ is live. Click to end Live mode.')
+      : 'Switch Live mode on and just speak (“Hey DJ” works too)';
+    if (!isLive && this.dom.aiDetail) {
+      // Off air: the readout carries the how-to hint (there is no separate label any more).
+      this.dom.aiDetail.textContent = this.libraryLoading && this.libraryLoading.phase !== 'failed' ? 'Scanning your music library…'
+        : (this.serverReady ? 'Say “Hey DJ” or switch Live on.' : 'Preparing AI DJ…');
     }
 
-    const track = this.currentTrackIndex >= 0 ? this.tracks[this.currentTrackIndex] : null;
-    this.dom.nowPlayingState.textContent = this.isPlaying ? '▶ Now Playing' : '⏸ Paused';
-    this.dom.nowPlayingState.className = this.isPlaying ? 'now-playing-label active' : 'now-playing-label';
-    this.dom.nowPlayingTitle.textContent = track ? track.title : '(Ready)';
-    this.dom.nowPlayingArtist.textContent = track ? track.artist : '—';
-    this._updateActivePlaylistUI(track);
-    this.dom.discIcon.className = this.isPlaying ? 'disc spinning' : 'disc';
-    this.dom.playPauseIcon.textContent = this.isPlaying ? '⏸' : '▶';
+    const track = !this.source && this.currentTrackIndex >= 0 ? this.tracks[this.currentTrackIndex] : null;
+    const src = describeSource(this.source, { nowTitle: this.radioNowTitle });
+
+    if (this.source) {
+      const stateText = this.isPlaying ? (src.isLive ? '🔴 Live' : '▶ Now Playing') : (src.isLive ? '⏹ Stopped' : '⏸ Paused');
+      this.dom.nowPlayingState.textContent = stateText;
+      this.dom.nowPlayingState.className = 'now-playing-label' + (this.isPlaying ? ' active' : '') + (src.isLive ? ' live' : '');
+      this.dom.nowPlayingTitle.textContent = src.title;
+      this.dom.nowPlayingArtist.textContent = src.artist;
+      if (this.dom.nowPlayingSource) {
+        this.dom.nowPlayingSource.style.display = 'inline-flex';
+        this.dom.nowPlayingSource.className = 'now-playing-source ' + (src.isLive ? 'live' : this.source.type);
+        this.dom.nowPlayingSource.innerHTML = `<span class="source-badge">${src.isLive ? '<i class="live-dot"></i>' : ''}${src.badge}</span>`
+          + (src.sourceLine ? `<span class="source-line">${escapeHtml(src.sourceLine)}</span>` : '');
+      }
+      if (this.dom.nowPlayingPlaylist) this.dom.nowPlayingPlaylist.style.display = 'none';
+    } else {
+      this.dom.nowPlayingState.textContent = this.isPlaying ? '▶ Now Playing' : '⏸ Paused';
+      this.dom.nowPlayingState.className = this.isPlaying ? 'now-playing-label active' : 'now-playing-label';
+      this.dom.nowPlayingTitle.textContent = track ? track.title : (this.libraryLoading && this.libraryLoading.phase !== 'failed' ? '(Loading library…)' : '(Ready)');
+      this.dom.nowPlayingArtist.textContent = track ? track.artist : '—';
+      if (this.dom.nowPlayingSource) this.dom.nowPlayingSource.style.display = 'none';
+      this._updateActivePlaylistUI(track);
+    }
+    this.dom.seekSlider.disabled = src.isLive;
+    this.dom.seekSlider.classList.toggle('live', src.isLive);
+    const kind = sourceKind(this.source);
+    const showSkips = !!kind?.seekable;
+    const showSpeed = !!kind?.speed;
+    if (this.dom.skipBackBtn) this.dom.skipBackBtn.style.display = showSkips ? '' : 'none';
+    if (this.dom.skipFwdBtn) this.dom.skipFwdBtn.style.display = showSkips ? '' : 'none';
+    if (this.dom.speedControl) {
+      this.dom.speedControl.style.display = showSpeed ? '' : 'none';
+      this.dom.speedControl.classList.toggle('active', Math.abs(this.podcastSpeed - 1) > 0.01);
+    }
+    if (this.dom.speedSelect) {
+      const v = String(this.podcastSpeed);
+      if (![...this.dom.speedSelect.options].some(o => o.value === v)) {
+        const opt = document.createElement('option');
+        opt.value = v; opt.textContent = `${v}×`;
+        this.dom.speedSelect.appendChild(opt);
+      }
+      this.dom.speedSelect.value = v;
+    }
+
+    // Fixed artwork tile (no spinning disc): kind badge for non-library
+    // sources, a small equalizer while something is actually playing.
+    this.dom.nowThumb.className = 'now-thumb' + (this.isPlaying ? ' playing' : '') + (kind ? ` kind-${this.source.type}` : '');
+    if (this.dom.nowThumbKind) {
+      this.dom.nowThumbKind.style.display = kind ? '' : 'none';
+      this.dom.nowThumbKind.textContent = kind ? kind.icon : '';
+      this.dom.nowThumbKind.title = kind ? kind.label : '';
+    }
+    if (this.dom.nowThumbPlaying) this.dom.nowThumbPlaying.style.display = this.isPlaying ? '' : 'none';
+    this._updateEpisodePanel();
+    this.dom.playPauseIcon.textContent = this.isPlaying ? (src.isLive ? '⏹' : '⏸') : '▶';
 
     this.trackRenderer.render(this.tracks, track?.id ?? null, this.trackFilterQuery);
     this._refreshExpandedHighlight(track?.id ?? null);
+    this._refreshSourceHighlights();
   }
 
   /** Is `track` one of the active playlist's songs? (unknown membership counts as yes) */
@@ -1966,16 +2685,28 @@ class AIDJApp {
     if (!body || !this.expandedPlaylist) return;
     const tracks = this.expandedPlaylist.tracks || [];
     body.querySelectorAll('.track-item').forEach((el, idx) => {
-      const isCurrent = tracks[idx]?.id === currentTrackId;
-      el.classList.toggle('track-active', isCurrent);
-      el.querySelector('.track-num')?.classList.toggle('track-num-active', isCurrent);
+      el.classList.toggle('track-active', tracks[idx]?.id === currentTrackId);
     });
   }
 
   _onTimeUpdate() {
     if (this.isDraggingSeek) return;
     const dur = this.dom.musicPlayer.duration;
+    if (this.source?.type === 'radio' || dur === Infinity) {
+      // Live stream: no seekable range, show time on air instead.
+      this.dom.seekSlider.value = 0;
+      this.dom.timeCurrent.textContent = formatTime(this.dom.musicPlayer.currentTime);
+      this.dom.timeDuration.textContent = 'LIVE';
+      return;
+    }
     if (!dur) return;
+    if (this.source?.type === 'podcast') {
+      this._rememberEpisodePosition();
+      this._updateEpisodeRemaining();
+    } else if (this.source?.type === 'audiobook') {
+      this._saveBookProgress();
+      this._updateEpisodeRemaining();
+    }
 
     const pct = (this.dom.musicPlayer.currentTime / dur) * 100;
     this.dom.seekSlider.value = pct || 0;
@@ -2039,13 +2770,21 @@ class AIDJApp {
   }
 
   _sendPlaybackState() {
-    const track = this.currentTrackIndex >= 0 ? this.tracks[this.currentTrackIndex] : null;
+    const track = !this.source && this.currentTrackIndex >= 0 ? this.tracks[this.currentTrackIndex] : null;
+    const player = this.dom.musicPlayer;
     this.socket.send(JSON.stringify({
       type: 'playback_state',
       playing: this.isPlaying,
       trackId: track?.id ?? null,
-      queue: this.queue.map(t => ({ id: t.id, title: t.title, artist: t.artist })),
-      playlist: this.activePlaylist ? { id: this.activePlaylist.id, name: this.activePlaylist.name } : null
+      queue: this.queue.map(t => ({ id: t.id, title: t.title, artist: t.artist, kind: t.kind || 'track' })),
+      playlist: this.activePlaylist ? { id: this.activePlaylist.id, name: this.activePlaylist.name } : null,
+      source: buildSourcePayload(this.source, {
+        position: player.currentTime,
+        duration: isFinite(player.duration) ? player.duration : null,
+        nowTitle: this.radioNowTitle,
+      }),
+      playbackRate: player.playbackRate || 1,
+      volume: this.userVolume,
     }));
   }
 
@@ -2102,50 +2841,91 @@ class AIDJApp {
 
   // --- View Management ---
 
+  /**
+   * Browse-panel views, one per source. To add a source (audiobooks, a
+   * streaming service, …): add a tab + view in index.html and one entry here.
+   */
+  get views() {
+    return {
+      tracks: { tab: this.dom.tabTracks, view: this.dom.tracksView, render: () => this.trackRenderer.refresh() },
+      radio: { tab: this.dom.tabRadio, view: this.dom.radioView, render: () => this.renderStations() },
+      podcasts: { tab: this.dom.tabPodcasts, view: this.dom.podcastsView, render: () => this.renderPodcasts() },
+      audiobooks: { tab: this.dom.tabAudiobooks, view: this.dom.audiobooksView, render: () => this.renderAudiobooks() },
+      streaming: { tab: this.dom.tabStreaming, view: this.dom.streamingView, render: () => this.renderStreaming() },
+    };
+  }
+
   switchView(viewName) {
+    const views = this.views;
+    if (!views[viewName]) return;
     this.currentView = viewName;
-    if (this.dom.tabTracks) this.dom.tabTracks.classList.toggle('active', viewName === 'tracks');
-    if (this.dom.tabPlaylists) this.dom.tabPlaylists.classList.toggle('active', viewName === 'playlists');
-
-    if (this.dom.tracksView) this.dom.tracksView.style.display = viewName === 'tracks' ? 'flex' : 'none';
-    if (this.dom.playlistsView) this.dom.playlistsView.style.display = viewName === 'playlists' ? 'flex' : 'none';
-
-    if (viewName === 'playlists') {
-      this.renderPlaylists();
+    for (const [name, v] of Object.entries(views)) {
+      v.tab?.classList.toggle('active', viewName === name);
+      v.tab?.setAttribute('aria-selected', String(viewName === name));
+      if (v.view) v.view.style.display = viewName === name ? 'flex' : 'none';
     }
+    views[viewName].render();
+    this._revealActiveTab();
+    this._updateTabArrows();
+  }
+
+  /** Shared wiring for the filter boxes on the Radio / Podcasts tabs. */
+  _bindFilter(input, clearBtn, onChange) {
+    if (!input) return;
+    input.addEventListener('input', (e) => {
+      const q = e.target.value;
+      if (clearBtn) clearBtn.style.display = q ? 'inline' : 'none';
+      onChange(q);
+    });
+    clearBtn?.addEventListener('click', () => {
+      input.value = '';
+      clearBtn.style.display = 'none';
+      onChange('');
+    });
   }
 
   // --- Queue accordion (Up Next card expands in place) ---
 
   toggleQueueExpanded(force) {
-    const next = typeof force === 'boolean' ? force : !this.queueExpanded;
-    this.queueExpanded = next && this.queue.length > 0;
+    this.queueExpanded = typeof force === 'boolean' ? force : !this.queueExpanded;
     this._renderQueueExpanded();
   }
 
   _renderQueueExpanded() {
     if (!this.dom.queueExpanded || !this.dom.queueTracksContainer) return;
+    // The preference survives an empty queue: it simply has nothing to show.
     const open = this.queueExpanded && this.queue.length > 0;
-    this.queueExpanded = open;
-    this.dom.queueExpanded.style.display = open ? 'block' : 'none';
-    this._setViewToggle(this.dom.queueViewBtn, open);
+    this._setViewToggle(this.dom.queueViewBtn, open, 'the full queue');
+    // The summary card repeats the first row: hide it while the full list is open to give the list the room.
+    if (this.dom.queueCard) this.dom.queueCard.style.display = open ? 'none' : '';
     if (!open) {
-      this.dom.queueTracksContainer.replaceChildren();
+      this._collapseBody(this.dom.queueExpanded).then(() => {
+        if (this.queue.length === 0) this.dom.queueTracksContainer.replaceChildren();
+      });
       return;
     }
+    const wasOpen = this.dom.queueExpanded.classList.contains('open');
 
     const frag = document.createDocumentFragment();
     this.queue.forEach((track, idx) => {
       const el = document.createElement('div');
-      el.className = 'track-item';
+      el.className = 'track-item queue-item';
+      el.dataset.queueIndex = idx;
+      el.draggable = true;
+      el.addEventListener('dragstart', (e) => {
+        e.dataTransfer.setData(DND.QUEUE, String(idx));
+        e.dataTransfer.effectAllowed = 'move';
+        el.classList.add('dragging');
+        this._dragging = { type: DND.QUEUE, index: idx };
+      });
+      el.addEventListener('dragend', () => { el.classList.remove('dragging'); this._dragging = null; this._clearDropMarks(); });
       el.innerHTML = `
-        <div class="track-num">${String(idx + 1).padStart(2, '0')}</div>
         <div class="track-info">
           <div class="track-title" title="${escapeHtml(track.title)}">${escapeHtml(track.title)}</div>
           <div class="track-artist">${escapeHtml(track.artist)}</div>
         </div>
         <div class="track-genre">${escapeHtml(track.genre || '')}</div>
-        <button class="track-cue-btn queue-item-play-btn" title="Play this now (skips the tracks above it)">▶ Play now</button>
+        <button class="track-play-btn queue-item-play-btn" title="Play this now (the rest stays cued)">▶ Play</button>
         <button class="track-remove-from-pl-btn queue-item-remove-btn" title="Remove from queue">✕</button>
       `;
       el.querySelector('.queue-item-play-btn').addEventListener('click', (e) => {
@@ -2159,24 +2939,124 @@ class AIDJApp {
       frag.appendChild(el);
     });
     this.dom.queueTracksContainer.replaceChildren(frag);
+    if (!wasOpen) {
+      // The cue is a flex child that sizes to the room available (not to its
+      // rows), so the measured height animation cannot apply: open it directly.
+      this.dom.queueExpanded.classList.add('open');
+      this.dom.queueExpanded.style.opacity = '1';
+    }
+    this.dom.queueExpanded.style.height = 'auto';
   }
 
-  /** Shared look/behaviour for the playlist and queue "view" toggles. */
-  _setViewToggle(btn, open) {
+  /**
+   * Collapse a card's expanded body with the CSS transition, resolving when it
+   * has finished (or after a safety timeout), so the caller can re-render.
+   */
+  _animateCollapse(card) {
+    const body = card?.querySelector('.playlist-expanded.open');
+    if (!body) return Promise.resolve();
+    card.classList.remove('expanded');
+    this._setViewToggle(card.querySelector('.view-toggle-btn'), false);
+    return this._collapseBody(body);
+  }
+
+  /**
+   * Smoothly open a collapsible body: measure its natural height, animate
+   * 0 → that height, then release to `auto` so it can keep growing.
+   */
+  _expandBody(body) {
+    if (!body || body.classList.contains('open')) return;
+    body.classList.add('open');
+    body.style.height = '0px';
+    body.style.opacity = '0';
+    const target = body.scrollHeight;
+    requestAnimationFrame(() => {
+      body.style.height = `${target}px`;
+      body.style.opacity = '1';
+    });
+    const release = (e) => {
+      if (e && e.target !== body) return;
+      body.style.height = 'auto';
+      body.removeEventListener('transitionend', release);
+    };
+    body.addEventListener('transitionend', release);
+    setTimeout(release, 450);
+  }
+
+  /** Smoothly close a collapsible body; resolves when done. */
+  _collapseBody(body) {
+    if (!body || !body.classList.contains('open')) return Promise.resolve();
+    return new Promise(resolve => {
+      body.style.height = `${body.scrollHeight}px`;
+      body.getBoundingClientRect();                 // commit the start height before animating
+      let done = false;
+      const finish = (e) => {
+        if (e && e.target !== body) return;
+        if (done) return;
+        done = true;
+        body.removeEventListener('transitionend', finish);
+        body.classList.remove('open');
+        body.style.height = '';
+        body.style.opacity = '';
+        resolve();
+      };
+      body.addEventListener('transitionend', finish);
+      setTimeout(finish, 450);
+      requestAnimationFrame(() => {
+        body.style.height = '0px';
+        body.style.opacity = '0';
+      });
+    });
+  }
+
+  /**
+   * Shared look/behaviour for every expand/collapse control: a double chevron
+   * pointing down when collapsed and up when open, sitting at the right edge
+   * of its card.
+   */
+  _setViewToggle(btn, open, what = 'tracks') {
     if (!btn) return;
-    btn.textContent = open ? '▴ Hide' : '👁 View';
-    btn.title = open ? 'Collapse' : 'Expand to see all tracks';
+    btn.innerHTML = '<span class="chevron2" aria-hidden="true"></span>';
+    btn.title = open ? `Hide ${what}` : `Show ${what}`;
+    btn.setAttribute('aria-label', btn.title);
     btn.classList.toggle('open', open);
     btn.setAttribute('aria-expanded', String(open));
   }
 
+  /**
+   * Rows in a list: click selects (toggle), double-click or Enter plays.
+   * `rows` are the elements, `onPlay(row)` starts playback.
+   */
+  _wireSelectableRows(container, rowSelector, onPlay, selectedClass = 'track-selected') {
+    if (!container) return;
+    const rows = container.querySelectorAll(rowSelector);
+    rows.forEach(row => {
+      row.tabIndex = 0;
+      row.addEventListener('click', (e) => {
+        if (e.target.closest('button, a, input')) return;
+        const wasSelected = row.classList.contains(selectedClass);
+        rows.forEach(r => r.classList.remove(selectedClass));
+        if (!wasSelected) row.classList.add(selectedClass);
+      });
+      row.addEventListener('dblclick', (e) => {
+        if (e.target.closest('button, a, input')) return;
+        onPlay(row);
+      });
+      row.addEventListener('keydown', (e) => {
+        if (e.target !== row || (e.key !== 'Enter' && e.key !== ' ')) return;
+        e.preventDefault();
+        onPlay(row);
+      });
+    });
+  }
+
   /** Jump to a queued track: everything before it is skipped, after it stays cued. */
+  /** ▶ on a cued row: play that item right away; everything else stays cued in place. */
   playQueueItemNow(index) {
     if (index < 0 || index >= this.queue.length) return;
-    const [track] = this.queue.splice(index, 1);
-    this.queue.splice(0, index);
+    const [item] = this.queue.splice(index, 1);
     this._updateQueueUI();
-    this.playTrackById(track.id);
+    this._playQueueItem(item);
   }
 
   // --- Playlist Management & Operations ---
@@ -2187,9 +3067,7 @@ class AIDJApp {
       if (res.ok) {
         this.playlists = await res.json();
         this._updatePlaylistBadges();
-        if (this.currentView === 'playlists') {
-          this.renderPlaylists();
-        }
+        this.renderPlaylists();
       }
     } catch (e) {
       console.error('[App] Failed to load playlists:', e);
@@ -2198,7 +3076,18 @@ class AIDJApp {
 
   _updatePlaylistBadges() {
     if (this.dom.badgeTracksCount) this.dom.badgeTracksCount.textContent = this.tracks.length;
-    if (this.dom.badgePlaylistsCount) this.dom.badgePlaylistsCount.textContent = this.playlists.length;
+    if (this.dom.playlistsCount) this.dom.playlistsCount.textContent = `${this.playlists.length}`;
+    if (this.dom.badgeRadioCount) this.dom.badgeRadioCount.textContent = this.stations.length;
+    if (this.dom.badgePodcastsCount) this.dom.badgePodcastsCount.textContent = this.podcasts.length;
+    if (this.dom.badgeAudiobooksCount) this.dom.badgeAudiobooksCount.textContent = this.audiobooks.length;
+    if (this.dom.badgeStreamingCount) {
+      const provs = this.streamingStatus?.providers || [];
+      const avail = provs.filter(p => p.available);
+      this.dom.badgeStreamingCount.textContent = provs.length ? avail.length : '…';
+      this.dom.badgeStreamingCount.title = provs.length
+        ? `${avail.length} of ${provs.length} streaming sources available: ${avail.map(p => p.name).join(', ') || 'none'}`
+        : 'Checking streaming sources…';
+    }
   }
 
   renderPlaylists() {
@@ -2225,6 +3114,7 @@ class AIDJApp {
         + (this.activePlaylist?.id === pl.id ? ' active-playlist' : '')
         + (isOpen ? ' expanded' : '');
       card.dataset.playlistId = pl.id;
+      this._makePlaylistDropTarget(card, pl);
       const coverArtUrl = pl.coverTrackId ? `/api/tracks/${pl.coverTrackId}/art` : '';
       const metaText = `${pl.trackCount} track${pl.trackCount === 1 ? '' : 's'}${pl.description ? ` • ${pl.description}` : ''}`;
 
@@ -2241,24 +3131,37 @@ class AIDJApp {
           </div>
           <div class="playlist-actions">
             <button class="playlist-btn-play" title="Play playlist">▶ Play</button>
-            <button class="view-toggle-btn" type="button"></button>
+            <button class="playlist-btn-cue" title="Add all tracks to the queue">+ Cue</button>
             <button class="playlist-btn-subtle danger" title="Delete playlist">✕</button>
+            <button class="view-toggle-btn" type="button"></button>
           </div>
         </div>
-        <div class="playlist-expanded" style="display:${isOpen ? 'block' : 'none'};">
-          <div class="playlist-expanded-actions">
-            <span class="playlist-expanded-sub"></span>
-            <button class="playlist-action-btn playlist-btn-shuffle" type="button" title="Shuffle &amp; play">🔀 Shuffle</button>
+        <div class="playlist-expanded${isOpen && this._openedWithoutAnimation === pl.id ? ' open' : ''}">
+          <div class="playlist-expanded-inner">
+            <div class="playlist-expanded-actions">
+              <span class="playlist-expanded-sub"></span>
+              <button class="playlist-action-btn playlist-btn-shuffle" type="button" title="Shuffle &amp; play">🔀 Shuffle</button>
+            </div>
+            <div class="track-list playlist-expanded-tracks"></div>
           </div>
-          <div class="track-list playlist-expanded-tracks"></div>
         </div>
       `;
+      if (isOpen && this._openedWithoutAnimation !== pl.id) {
+        // Newly opened: animate from collapsed once the card is in the DOM.
+        const body = card.querySelector('.playlist-expanded');
+        requestAnimationFrame(() => this._expandBody(body));
+        this._openedWithoutAnimation = pl.id;
+      }
 
-      this._setViewToggle(card.querySelector('.view-toggle-btn'), isOpen);
+      this._setViewToggle(card.querySelector('.view-toggle-btn'), isOpen, 'tracks');
 
       card.querySelector('.playlist-btn-play').addEventListener('click', (e) => {
         e.stopPropagation();
         this.playPlaylist(pl.id);
+      });
+      card.querySelector('.playlist-btn-cue').addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.cuePlaylist(pl.id);
       });
       card.querySelector('.view-toggle-btn').addEventListener('click', (e) => {
         e.stopPropagation();
@@ -2266,9 +3169,12 @@ class AIDJApp {
       });
       card.querySelector('.playlist-btn-subtle.danger').addEventListener('click', async (e) => {
         e.stopPropagation();
-        if (confirm(`Delete playlist "${pl.name}"?`)) {
-          await this.deletePlaylist(pl.id);
-        }
+        const ok = await this.showConfirm({
+          title: 'Delete playlist?',
+          message: `"${pl.name}" (${pl.trackCount} track${pl.trackCount === 1 ? '' : 's'}) will be deleted. Your music files are not affected.`,
+          confirmText: 'Delete', danger: true,
+        });
+        if (ok) await this.deletePlaylist(pl.id);
       });
       card.querySelector('.playlist-btn-shuffle').addEventListener('click', (e) => {
         e.stopPropagation();
@@ -2292,10 +3198,17 @@ class AIDJApp {
   async togglePlaylistExpanded(playlistId, force) {
     const open = typeof force === 'boolean' ? force : this.expandedPlaylist?.id !== playlistId;
     if (!open) {
-      if (this.expandedPlaylist?.id === playlistId) this.expandedPlaylist = null;
+      if (this.expandedPlaylist?.id !== playlistId) return;
+      await this._animateCollapse(this.dom.playlistsList?.querySelector(`.playlist-card[data-playlist-id="${playlistId}"]`));
+      this.expandedPlaylist = null;
+      this._openedWithoutAnimation = null;
       this.renderPlaylists();
       return;
     }
+    if (this.expandedPlaylist && this.expandedPlaylist.id !== playlistId) {
+      await this._animateCollapse(this.dom.playlistsList?.querySelector(`.playlist-card[data-playlist-id="${this.expandedPlaylist.id}"]`));
+    }
+    this._openedWithoutAnimation = null;
     try {
       const res = await fetch(`/api/playlists/${playlistId}`);
       if (!res.ok) return;
@@ -2310,8 +3223,17 @@ class AIDJApp {
 
   /** Switch to the Playlists tab and expand one playlist (toast "View", create flows). */
   async showPlaylist(playlistId) {
-    this.switchView('playlists');
+    this.togglePlaylistsSection(true);
     await this.togglePlaylistExpanded(playlistId, true);
+    this.dom.playlistsSection?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+
+  /** Fold / unfold the Playlists section under the cue. */
+  togglePlaylistsSection(force) {
+    this.playlistsCollapsed = typeof force === 'boolean' ? !force : !this.playlistsCollapsed;
+    if (this.dom.playlistsBody) this.dom.playlistsBody.style.display = this.playlistsCollapsed ? 'none' : '';
+    this.dom.playlistsSection?.classList.toggle('collapsed', this.playlistsCollapsed);
+    this._setViewToggle(this.dom.playlistsViewBtn, !this.playlistsCollapsed, 'the playlists');
   }
 
   /** Re-fetch the expanded playlist (after a track add/remove, rename, …). */
@@ -2324,7 +3246,7 @@ class AIDJApp {
     } catch (e) {
       console.error('[App] Failed to refresh expanded playlist:', e);
     }
-    if (this.currentView === 'playlists') this.renderPlaylists();
+    this.renderPlaylists();
   }
 
   _renderPlaylistExpandedBody(card, pl) {
@@ -2344,20 +3266,48 @@ class AIDJApp {
 
     const currentTrackId = this.tracks[this.currentTrackIndex]?.id;
     const frag = document.createDocumentFragment();
-    tracks.forEach((track, idx) => {
+    tracks.forEach((track) => {
       const el = document.createElement('div');
       const isCurrent = currentTrackId === track.id;
-      el.className = 'track-item' + (isCurrent ? ' track-active' : '');
+      el.className = 'track-item pl-track-item' + (isCurrent ? ' track-active' : '');
+      el.dataset.trackId = track.id;
+      el.draggable = true;
+      el.addEventListener('dragstart', (e) => {
+        // Drag within the playlist to reorder, or onto the cue to queue it.
+        e.dataTransfer.setData(DND.PLTRACK, JSON.stringify({ playlistId: pl.id, trackId: track.id }));
+        e.dataTransfer.setData(DND.TRACKS, JSON.stringify({ trackIds: [track.id], label: track.title }));
+        e.dataTransfer.effectAllowed = 'copyMove';
+        el.classList.add('dragging');
+        this._dragging = { type: DND.PLTRACK, playlistId: pl.id, trackId: track.id };
+      });
+      el.addEventListener('dragend', () => { el.classList.remove('dragging'); this._dragging = null; this._clearDropMarks(); });
+      el.addEventListener('dragover', (e) => {
+        if (this._dragging?.type !== DND.PLTRACK || this._dragging.playlistId !== pl.id) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        this._markDropBefore(el, e);
+      });
+      el.addEventListener('drop', (e) => {
+        if (this._dragging?.type !== DND.PLTRACK || this._dragging.playlistId !== pl.id) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const before = this._dropIsBefore(el, e);
+        this._clearDropMarks();
+        this.reorderPlaylistTrack(pl, this._dragging.trackId, track.id, before);
+      });
       el.innerHTML = `
-        <div class="track-num ${isCurrent ? 'track-num-active' : ''}">${String(idx + 1).padStart(2, '0')}</div>
+        <span class="track-lead eq-bars" aria-hidden="true"><i></i><i></i><i></i></span>
         <div class="track-info">
           <div class="track-title" title="${escapeHtml(track.title)}">${escapeHtml(track.title)}</div>
           <div class="track-artist">${escapeHtml(track.artist)}</div>
         </div>
         <div class="track-genre">${escapeHtml(track.genre || '')}</div>
+        <button class="track-play-btn" title="Play this track">▶</button>
         <button class="track-cue-btn" title="Cue up next">+ Cue</button>
         <button class="track-remove-from-pl-btn" title="Remove from playlist">✕</button>
       `;
+      // ▶ plays just this song (the queue is left alone); the card's ▶ Play / 🔀 Shuffle start the whole playlist.
+      el.querySelector('.track-play-btn').addEventListener('click', (e) => { e.stopPropagation(); this.playTrackById(track.id); });
       el.querySelector('.track-cue-btn').addEventListener('click', (e) => {
         e.stopPropagation();
         this.queueTrackById(track.id);
@@ -2366,18 +3316,10 @@ class AIDJApp {
         e.stopPropagation();
         await this.removeTrackFromPlaylist(pl.id, track.id);
       });
-      el.addEventListener('click', () => {
-        // Start the playlist from this track; the rest stays cued
-        this.activePlaylist = pl;
-        this.queue = tracks.slice(idx + 1);
-        this._updateQueueUI();
-        this.playTrackById(track.id);
-        this._sendPlaybackState();
-        this.renderPlaylists();
-      });
       frag.appendChild(el);
     });
     container.replaceChildren(frag);
+    this._wireSelectableRows(container, '.track-item', (row) => this.playTrackById(row.dataset.trackId));
   }
 
   async playPlaylist(playlistId, shuffle = false) {
@@ -2405,9 +3347,51 @@ class AIDJApp {
       );
 
       this._sendPlaybackState();
-      if (this.currentView === 'playlists') this.renderPlaylists();
+      this.renderPlaylists();
     } catch (e) {
       console.error('[App] Failed to play playlist:', e);
+    }
+  }
+
+  /** Play a set of tracks: the first now, the rest cued in order (a group header's ▶). */
+  playTracks(tracks) {
+    const playable = (tracks || []).filter(t => t && this.tracks.some(x => x.id === t.id));
+    if (!playable.length) return;
+    this._leaveSource();
+    this.activePlaylist = null;
+    this.queue = playable.slice(1);
+    this._updateQueueUI();
+    this.playTrackById(playable[0].id);
+    this._sendPlaybackState();
+  }
+
+  /** Cue a set of tracks after whatever is already queued (a group header's + Cue). */
+  queueTracks(tracks) {
+    const queuedIds = new Set(this.queue.map(q => q.id));
+    const add = (tracks || []).filter(t => t && !queuedIds.has(t.id) && this.tracks.some(x => x.id === t.id));
+    if (!add.length) {
+      this.showPlaylistToast('➕ Nothing new to cue', 'Those tracks are already in the queue', null);
+      return;
+    }
+    this.queue.push(...add);
+    this._updateQueueUI();
+    this._sendPlaybackState();
+    this.showPlaylistToast('➕ Cued', `${add.length} track${add.length === 1 ? '' : 's'} added to the queue`, null);
+  }
+
+  /** "+ Cue" on a playlist card: append its tracks after whatever is cued. */
+  async cuePlaylist(playlistId) {
+    try {
+      const res = await fetch(`/api/playlists/${playlistId}`);
+      if (!res.ok) return;
+      const pl = await res.json();
+      if (!(pl.tracks || []).length) {
+        this.showPlaylistToast('📑 Nothing to cue', `"${pl.name}" has no tracks yet`, pl.id);
+        return;
+      }
+      this.handlePlaylistQueued({ id: pl.id, name: pl.name }, pl.tracks);
+    } catch (e) {
+      console.error('[App] Cue playlist error:', e);
     }
   }
 
@@ -2546,6 +3530,2166 @@ class AIDJApp {
     }
   }
 
+  // ==========================================
+  // LIVE RADIO & PODCASTS
+  // ==========================================
+
+  // --- Source playback (shared by radio and podcasts) ---
+
+  /**
+   * Point the deck's <audio> at a non-library source. Same audio graph and
+   * fade-in as local tracks; the URL is a same-origin backend relay.
+   */
+  async _beginSourcePlayback(source, url, { art = '', icon = '💿' } = {}) {
+    this._flushSourceProgress();
+    this._stopRadioNowPolling();
+    this.radioNowTitle = '';
+    this.source = source;
+
+    this.audio.initMusicPlayer(this.dom.musicPlayer);
+    if (this.audio.ctx.state === 'suspended') {
+      await this.audio.ctx.resume();
+    }
+    this.currentPlayAbort?.abort();
+    this.currentPlayAbort = new AbortController();
+
+    const onPlaying = () => {
+      this.audio.fadeTrackUp(this.userVolume, 1.0, this._shouldDuck());
+    };
+    this.dom.musicPlayer.addEventListener('playing', onPlaying, { once: true });
+    this.dom.musicPlayer.src = url;
+
+    this._setThumbArt(art, icon, () => this.source === source);
+
+    if ('mediaSession' in navigator) {
+      const d = describeSource(source, { nowTitle: this.radioNowTitle });
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: d.title || '', artist: d.artist || '',
+        artwork: art ? [{ src: art, sizes: '512x512', type: 'image/jpeg' }] : [],
+      });
+    }
+
+    this.isPlaying = true;
+    this._applyPlaybackRate();
+    this._updateUI();
+    try {
+      await this.dom.musicPlayer.play();
+      this._applyPlaybackRate();          // some browsers reset the rate on a new src
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      console.error('[Source] Playback error:', e);
+      this.isPlaying = false;
+      this._updateUI();
+    }
+  }
+
+  /** Artwork tile with a probe so a missing/broken image falls back to an emoji. */
+  _setThumbArt(url, fallbackIcon, stillCurrent) {
+    const el = this.dom.nowThumb;
+    el.style.backgroundImage = 'none';
+    el.textContent = fallbackIcon;
+    if (!url) return;
+    const img = new Image();
+    img.onload = () => {
+      if (!stillCurrent()) return;
+      el.style.backgroundImage = `url('${url}')`;
+      el.textContent = '';
+    };
+    img.onerror = () => {
+      if (!stillCurrent()) return;
+      el.style.backgroundImage = 'none';
+      el.textContent = fallbackIcon;
+    };
+    img.src = url;
+  }
+
+  /**
+   * Long descriptions (podcast blurbs, episode notes) are clamped to a few
+   * lines; a "More" link appears only when the text actually overflows, and
+   * toggles the full text ("Less"). The overflow check runs once the element
+   * is laid out, so this works for rows built in a fragment too.
+   */
+  _setClampedText(el, text, lines = 2) {
+    el.textContent = text || '';
+    el.classList.add('clampable');
+    el.classList.remove('expanded');
+    el.style.setProperty('--clamp-lines', String(lines));
+    el.nextElementSibling?.classList?.contains('clamp-toggle') && el.nextElementSibling.remove();
+    let tries = 0;
+    const check = () => {
+      if (!el.isConnected) { if (tries++ < 30) requestAnimationFrame(check); return; }
+      if (el.scrollHeight <= el.clientHeight + 1) return;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'link-btn clamp-toggle';
+      btn.textContent = 'More';
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const open = el.classList.toggle('expanded');
+        btn.textContent = open ? 'Less' : 'More';
+      });
+      el.insertAdjacentElement('afterend', btn);
+    };
+    requestAnimationFrame(check);
+  }
+
+  /**
+   * Podcast episode details under the NOW PLAYING header: number • date •
+   * length • time left, plus show notes (clamped, expandable).
+   */
+  _updateEpisodePanel() {
+    const panel = this.dom.episodePanel;
+    if (!panel) return;
+    const ep = this.source?.type === 'podcast' ? this.source.episode : null;
+    const ch = this.source?.type === 'audiobook' ? this.source.chapter : null;
+    if (!ep && !ch) {
+      panel.style.display = 'none';
+      this.episodeNotesExpanded = false;
+      return;
+    }
+    panel.style.display = '';
+    if (this.dom.episodePanelLabel) this.dom.episodePanelLabel.textContent = ch ? 'Chapter' : 'Episode';
+    if (ch) {
+      const book = this.source.book || {};
+      if (this.dom.episodeMeta) this.dom.episodeMeta.textContent = chapterMetaLine(book, ch) || 'Chapter';
+      const about = [book.author ? `By ${book.author}` : '', book.narrator ? `Read by ${book.narrator}` : '',
+        book.duration ? `Book length ${formatDuration(book.duration)}` : ''].filter(Boolean).join(' • ');
+      if (this.dom.episodeNotes) {
+        this.dom.episodeNotes.textContent = about || 'Audiobook chapter';
+        this.dom.episodeNotes.classList.add('clamped');
+        this.dom.episodeNotes.classList.toggle('muted', !about);
+      }
+      if (this.dom.episodeNotesToggle) this.dom.episodeNotesToggle.style.display = 'none';
+      this._updateEpisodeRemaining();
+      return;
+    }
+    if (this.dom.episodeMeta) this.dom.episodeMeta.textContent = episodeMetaLine(ep) || 'Episode';
+    const notes = (ep.description || '').trim();
+    if (this.dom.episodeNotes) {
+      this.dom.episodeNotes.textContent = notes || 'No show notes for this episode.';
+      this.dom.episodeNotes.classList.toggle('clamped', !this.episodeNotesExpanded);
+      this.dom.episodeNotes.classList.toggle('muted', !notes);
+    }
+    if (this.dom.episodeNotesToggle) {
+      this.dom.episodeNotesToggle.style.display = notes.length > 160 ? '' : 'none';
+      this.dom.episodeNotesToggle.innerHTML = `<span class="chevron2" aria-hidden="true"></span> ${this.episodeNotesExpanded ? 'Less' : 'More'}`;
+      this.dom.episodeNotesToggle.classList.toggle('open', this.episodeNotesExpanded);
+      this.dom.episodeNotesToggle.setAttribute('aria-expanded', String(this.episodeNotesExpanded));
+    }
+    this._updateEpisodeRemaining();
+  }
+
+  toggleEpisodeNotes() {
+    this.episodeNotesExpanded = !this.episodeNotesExpanded;
+    this._updateEpisodePanel();
+  }
+
+  _updateEpisodeRemaining() {
+    if (!this.dom.episodeRemaining) return;
+    const type = this.source?.type;
+    if (type !== 'podcast' && type !== 'audiobook') { this.dom.episodeRemaining.textContent = ''; return; }
+    const player = this.dom.musicPlayer;
+    const known = type === 'podcast' ? this.source.episode?.duration : this.source.chapter?.duration;
+    const dur = isFinite(player.duration) && player.duration > 0 ? player.duration : (known || 0);
+    const label = remainingLabel(player.currentTime, dur);
+    this.dom.episodeRemaining.textContent = label ? `• ${label}` : '';
+  }
+
+  /**
+   * In-app confirmation dialog (replaces window.confirm so every dialog looks
+   * and behaves the same). Resolves true when confirmed.
+   */
+  showConfirm({ title = 'Are you sure?', message = '', confirmText = 'OK', cancelText = 'Cancel', danger = false } = {}) {
+    if (!this.dom.confirmModal) return Promise.resolve(window.confirm(message || title));
+    this._resolveConfirm(false);                   // close any dialog already up
+    if (this.dom.confirmTitle) this.dom.confirmTitle.textContent = title;
+    if (this.dom.confirmMessage) this.dom.confirmMessage.textContent = message;
+    if (this.dom.confirmOkBtn) {
+      this.dom.confirmOkBtn.textContent = confirmText;
+      this.dom.confirmOkBtn.className = 'modal-btn-confirm' + (danger ? ' danger' : '');
+    }
+    if (this.dom.confirmCancelBtn) {
+      this.dom.confirmCancelBtn.textContent = cancelText;
+      this.dom.confirmCancelBtn.style.display = cancelText ? '' : 'none';
+    }
+    this.dom.confirmModal.style.display = 'flex';
+    this.dom.confirmOkBtn?.focus();
+    return new Promise(resolve => { this._confirmResolve = resolve; });
+  }
+
+  /** Informational dialog with a single OK button (replaces window.alert). */
+  showAlert(title, message = '') {
+    return this.showConfirm({ title, message, confirmText: 'OK', cancelText: '' });
+  }
+
+  _resolveConfirm(value) {
+    if (this.dom.confirmModal) this.dom.confirmModal.style.display = 'none';
+    const resolve = this._confirmResolve;
+    this._confirmResolve = null;
+    if (resolve) resolve(value);
+  }
+
+  _updateSortBar() {
+    const bar = this.dom.trackSortBar;
+    if (!bar) return;
+    bar.querySelectorAll('.sort-btn[data-sort]').forEach(btn => {
+      const active = (btn.dataset.sort || '') === this.trackRenderer.sortKey;
+      btn.classList.toggle('active', active);
+      const base = btn.textContent.replace(/\s*[▲▼]$/, '');
+      btn.textContent = active && this.trackRenderer.sortKey ? `${base} ${this.trackRenderer.sortDir > 0 ? '▲' : '▼'}` : base;
+      btn.setAttribute('aria-pressed', String(active));
+    });
+    const toggle = this.dom.trackGroupsToggle;
+    if (toggle) {
+      const grouped = !!this.trackRenderer.groupMode && this.trackRenderer.groups.length > 0;
+      toggle.style.display = grouped ? '' : 'none';
+      toggle.textContent = this.trackRenderer.allCollapsed ? 'Expand all' : 'Collapse all';
+      toggle.title = this.trackRenderer.allCollapsed ? 'Expand every group' : 'Collapse every group to its header';
+    }
+  }
+
+  // --- Podcast playback speed ---
+
+  _loadPodcastSpeed() {
+    const v = parseFloat(window.localStorage.getItem('aidj.podcastSpeed') || '1');
+    return isFinite(v) && v >= 0.5 && v <= 3 ? v : 1;
+  }
+
+  /** Apply a rate to the player. Only seekable sources (podcasts) keep a custom speed. */
+  setPlaybackSpeed(rate, { remember = true } = {}) {
+    const r = Math.min(3, Math.max(0.5, Number(rate) || 1));
+    const kind = sourceKind(this.source);
+    if (kind?.speed) {
+      this.podcastSpeed = r;
+      if (remember) { try { window.localStorage.setItem('aidj.podcastSpeed', String(r)); } catch (e) { /* ignore */ } }
+    }
+    this._applyPlaybackRate();
+    this._updateUI();
+    this._sendPlaybackState();
+    return this.dom.musicPlayer.playbackRate;
+  }
+
+  /** The app's music volume (slider). Used by the slider, the DJ's setVolume tool and the UI. */
+  setUserVolume(level, { fromSlider = false } = {}) {
+    if (!isFinite(level)) return;
+    this.userVolume = clamp(level, 0, 1);
+    if (!fromSlider && this.dom.volumeSlider) this.dom.volumeSlider.value = String(this.userVolume);
+    if (this.audio._musicSource) {
+      this.audio.setVolume(this.userVolume, { ducked: this._shouldDuck() });
+    } else {
+      this.dom.musicPlayer.volume = this.userVolume;
+    }
+    if (!fromSlider) this._sendPlaybackState();
+  }
+
+  /** Music, live radio and streamed tracks always play at 1×; podcasts and audiobooks at the remembered speed. */
+  _applyPlaybackRate() {
+    const rate = sourceKind(this.source)?.speed ? this.podcastSpeed : 1;
+    const player = this.dom.musicPlayer;
+    if (Math.abs(player.playbackRate - rate) > 0.001) player.playbackRate = rate;
+    player.defaultPlaybackRate = rate;
+  }
+
+  _loadStarterDismissed() {
+    try {
+      const parsed = JSON.parse(window.localStorage.getItem(STARTER_NOTE_KEY) || '{}');
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  dismissStarterNote(kind) {
+    this.starterDismissed = { ...this.starterDismissed, [kind]: true };
+    try { window.localStorage.setItem(STARTER_NOTE_KEY, JSON.stringify(this.starterDismissed)); } catch (e) { /* private mode */ }
+    this._updateStarterNotes();
+  }
+
+  /** Show the "starter picks" explainer while starter items exist and it wasn't dismissed. */
+  _updateStarterNotes() {
+    if (this.dom.radioStarterNote) {
+      this.dom.radioStarterNote.style.display = shouldShowStarterNote(this.stations, this.starterDismissed.radio) ? 'flex' : 'none';
+    }
+    if (this.dom.podcastStarterNote) {
+      this.dom.podcastStarterNote.style.display = shouldShowStarterNote(this.podcasts, this.starterDismissed.podcast) ? 'flex' : 'none';
+    }
+  }
+
+  /** Remember where the outgoing podcast episode / audiobook chapter was (before the player moves on). */
+  _flushSourceProgress() {
+    if (this.source?.type === 'podcast') this._rememberEpisodePosition(true);
+    if (this.source?.type === 'audiobook') this._saveBookProgress(true);
+  }
+
+  /** Back to the local deck (called by every track/playlist playback path). */
+  _leaveSource() {
+    if (!this.source) return;
+    this._flushSourceProgress();
+    this._stopRadioNowPolling();
+    clearTimeout(this.radioReconnectTimer);
+    this.radioReconnectTimer = null;
+    this.radioNowTitle = '';
+    this.source = null;
+  }
+
+  _onMediaEnded() {
+    if (this.source?.type === 'radio') {
+      // A live stream never "ends" — the relay dropped. Re-tune once.
+      console.warn('[Radio] Stream ended unexpectedly, re-tuning…');
+      this.isPlaying = false;
+      this._updateUI();
+      if (!this.radioReconnectTimer) {
+        const station = this.source.station;
+        this.radioReconnectTimer = setTimeout(() => {
+          this.radioReconnectTimer = null;
+          if (this.source?.type === 'radio' && this.source.station?.id === station.id && !this.isPlaying) {
+            this.playStation(station, { origin: this.source.origin, silent: true });
+          }
+        }, 2000);
+      }
+      return;
+    }
+    if (this.source?.type === 'podcast') {
+      const ep = this.source.episode;
+      this.podcastPositions = rememberPosition(this.podcastPositions, ep.id, ep.duration || Infinity, ep.duration || Infinity);
+      savePositions(window.localStorage, this.podcastPositions);
+      if (this.expandedPodcast?.id === this.source.podcast.id) this.renderPodcasts();
+    }
+    if (this.source?.type === 'stream') {
+      this._onStreamEnded();
+      return;
+    }
+    if (this.source?.type === 'audiobook') {
+      // A book keeps reading: next chapter first, the queue/library only after the last one.
+      const { book, chapter } = this.source;
+      const next = nextChapter(book, chapter.id);
+      if (next) { this.playChapter(book, next); return; }
+      this._saveBookProgress(true, { finished: true });
+      this.showPlaylistToast('📖 Finished', `${book.title} — the end`, null);
+    }
+    this.nextTrack();
+  }
+
+  _onMediaError() {
+    if (!this.source) return;           // local tracks keep their existing handling
+    const err = this.dom.musicPlayer.error;
+    // stopRadio() clears src and calls load(), which Chrome reports as an
+    // "empty src" error — that one is ours, not a playback failure.
+    if (!this.dom.musicPlayer.currentSrc) return;
+    console.error('[Source] Media error:', err?.code, err?.message);
+    this.isPlaying = false;
+    this._updateUI();
+    this._sendPlaybackState();
+    const d = describeSource(this.source);
+    const why = { radio: 'The station stream is unavailable or not supported (HLS / legacy SHOUTcast).',
+      podcast: 'The episode file could not be fetched.', audiobook: 'The chapter file could not be read.',
+      stream: `The audio stream could not be fetched from ${providerName(this.source.track?.provider)}.` };
+    this.showPlaylistToast(`⚠️ Couldn't play ${d.title}`, why[this.source.type] || 'Playback failed.', null);
+  }
+
+  seekRelative(seconds) {
+    if (!seconds) return;
+    if (this.source?.type === 'radio') {
+      this.showPlaylistToast('📻 Live radio', 'Live streams can\'t be skipped forward or back', null);
+      return;
+    }
+    const player = this.dom.musicPlayer;
+    if (!player.currentSrc) return;
+    player.currentTime = clampSeek(player.currentTime, seconds, player.duration);
+    if (this.source?.type === 'podcast') this._rememberEpisodePosition(true);
+    if (this.source?.type === 'audiobook') this._saveBookProgress(true);
+    this._onTimeUpdate();
+    this._sendPlaybackState();
+  }
+
+  // --- Radio ---
+
+  async loadStations() {
+    try {
+      const res = await fetch('/api/radio');
+      if (res.ok) {
+        this.stations = await res.json();
+        this._updatePlaylistBadges();
+        this._updateStarterNotes();
+        if (this.currentView === 'radio') this.renderStations();
+      }
+    } catch (e) {
+      console.error('[App] Failed to load stations:', e);
+    }
+  }
+
+  async playStation(station, { origin = 'saved', silent = false } = {}) {
+    if (!station?.id) return;
+    if (origin === 'directory' || !this.stations.some(s => s.id === station.id)) {
+      // The relay only serves saved stations — and a station you chose to
+      // play is one you'll want again. Save quietly, then tune in.
+      const saved = await this.saveStation(station, { silent: true });
+      if (!saved) {
+        this.showPlaylistToast('⚠️ Could not save station', station.name, null);
+        return;
+      }
+      station = saved;
+      origin = 'saved';
+    }
+    const url = withCacheBuster(`/api/radio/${station.id}/stream`);
+    await this._beginSourcePlayback({ type: 'radio', station, origin }, url, { art: station.favicon || '', icon: '📻' });
+    this._startRadioNowPolling(station.id);
+    this._sendPlaybackState();
+    if (this.currentView === 'radio') this.renderStations();
+    if (!silent) {
+      const meta = [station.genre, station.country].filter(Boolean).join(' • ');
+      this.showPlaylistToast(`📻 ${station.name}`, `Live radio${meta ? ' • ' + meta : ''}`, null);
+    }
+  }
+
+  /** Live radio has no pause: drop the stream and release the connection. */
+  stopRadio() {
+    if (this.source?.type !== 'radio') return;
+    this._stopRadioNowPolling();
+    clearTimeout(this.radioReconnectTimer);
+    this.radioReconnectTimer = null;
+    this.currentPlayAbort?.abort();
+    this.dom.musicPlayer.pause();
+    this.dom.musicPlayer.removeAttribute('src');
+    this.dom.musicPlayer.load();
+    this.isPlaying = false;
+    this._updateUI();
+    this._sendPlaybackState();
+  }
+
+  _startRadioNowPolling(stationId) {
+    this._stopRadioNowPolling();
+    const poll = async () => {
+      if (this.source?.type !== 'radio' || this.source.station?.id !== stationId) return;
+      try {
+        const res = await fetch(`/api/radio/${stationId}/now`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const title = (data.title || '').trim();
+        if (title !== this.radioNowTitle && this.source?.station?.id === stationId) {
+          this.radioNowTitle = title;
+          this._updateUI();
+          this._sendPlaybackState();
+          if ('mediaSession' in navigator && navigator.mediaSession.metadata) {
+            const d = describeSource(this.source, { nowTitle: title });
+            navigator.mediaSession.metadata = new MediaMetadata({ title: d.title, artist: d.artist });
+          }
+        }
+      } catch (e) { /* offline blip; try again next tick */ }
+    };
+    setTimeout(poll, 1500);
+    this.radioNowTimer = setInterval(poll, RADIO_NOW_POLL_MS);
+  }
+
+  _stopRadioNowPolling() {
+    if (this.radioNowTimer) {
+      clearInterval(this.radioNowTimer);
+      this.radioNowTimer = null;
+    }
+  }
+
+  renderStations() {
+    const list = this.dom.stationsList;
+    if (!list) return;
+    const visible = filterStations(this.stations, this.radioFilterQuery);
+    if (visible.length === 0) {
+      list.innerHTML = `<div class="sources-empty">${this.radioFilterQuery
+        ? 'No stations matching search'
+        : 'No radio stations yet. Click Find Stations…, or ask AI DJ: “play some jazz radio”.'}</div>`;
+      return;
+    }
+    const playingId = this.source?.type === 'radio' ? this.source.station?.id : null;
+    const frag = document.createDocumentFragment();
+    visible.forEach(st => {
+      const card = document.createElement('div');
+      const isPlaying = st.id === playingId;
+      card.className = 'playlist-card source-card' + (isPlaying ? ' active-source' : '');
+      card.dataset.stationId = st.id;
+      const meta = [st.genre, st.country, st.description].filter(Boolean).join(' • ') || 'Internet radio';
+      card.innerHTML = `
+        <div class="playlist-card-header">
+          <div class="playlist-cover source-cover">📻</div>
+          <div class="playlist-info">
+            <div class="playlist-name-row">
+              <span class="playlist-name" title="${escapeHtml(st.name)}">${escapeHtml(st.name)}</span>
+              ${st.source === 'default' ? this._starterBadgeHtml() : ''}
+              ${isPlaying ? this._livePillHtml() : ''}
+            </div>
+            <div class="playlist-meta" title="${escapeHtml(meta)}">${escapeHtml(meta)}</div>
+          </div>
+          <div class="playlist-actions">
+            <button class="playlist-btn-play${isPlaying && this.isPlaying ? ' is-stop' : ''}" title="${isPlaying && this.isPlaying ? 'Stop' : 'Tune in'}">${isPlaying && this.isPlaying ? '⏹ Stop' : '▶ Play'}</button>
+            <button class="playlist-btn-subtle danger" title="Remove station">✕</button>
+          </div>
+        </div>`;
+      this._applyCover(card.querySelector('.source-cover'), st.favicon, '📻');
+      card.querySelector('.playlist-btn-play').addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (isPlaying && this.isPlaying) this.stopRadio();
+        else this.playStation(st);
+      });
+      card.querySelector('.playlist-btn-subtle.danger').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const ok = await this.showConfirm({ title: 'Remove station?', message: `"${st.name}" will be removed from your saved stations.`, confirmText: 'Remove', danger: true });
+        if (ok) await this.deleteStation(st.id);
+      });
+      frag.appendChild(card);
+    });
+    list.replaceChildren(frag);
+    this._wireSelectableRows(list, '.source-card', (row) => {
+      const st = this.stations.find(x => x.id === row.dataset.stationId);
+      if (st) this.playStation(st);
+    }, 'source-selected');
+  }
+
+  _livePillHtml() {
+    return '<span class="badge-now-playing badge-live" title="On air now"><i class="live-dot"></i>LIVE</span>';
+  }
+
+  _starterBadgeHtml() {
+    return '<span class="badge-starter" title="Pre-loaded starter pick — remove it with ✕ or add your own">Starter</span>';
+  }
+
+  /** Remote logos/artwork are optional and often broken: probe before showing. */
+  _applyCover(el, url, fallbackIcon) {
+    if (!el) return;
+    el.textContent = fallbackIcon;
+    el.style.backgroundImage = '';
+    if (!url) return;
+    const img = new Image();
+    img.onload = () => { el.style.backgroundImage = `url('${url}')`; el.textContent = ''; };
+    img.src = url;
+  }
+
+  /** Keep LIVE pills / active cards in the Radio and Podcasts tabs in sync without re-rendering. */
+  _refreshSourceHighlights() {
+    if (this.currentView === 'radio' && this.dom.stationsList) {
+      const playingId = this.source?.type === 'radio' ? this.source.station?.id : null;
+      let stale = false;
+      this.dom.stationsList.querySelectorAll('.source-card').forEach(card => {
+        const active = card.dataset.stationId === playingId;
+        if (card.classList.contains('active-source') !== active) stale = true;
+        const btn = card.querySelector('.playlist-btn-play');
+        if (btn) {
+          const label = active && this.isPlaying ? '⏹ Stop' : '▶ Play';
+          if (btn.textContent !== label) stale = true;
+        }
+      });
+      if (stale) this.renderStations();
+    }
+    if (this.currentView === 'podcasts' && this.dom.podcastsList) {
+      const epId = this.source?.type === 'podcast' ? this.source.episode?.id : null;
+      this.dom.podcastsList.querySelectorAll('.episode-item').forEach(el => {
+        el.classList.toggle('track-active', el.dataset.episodeId === epId);
+      });
+    }
+    if (this.currentView === 'audiobooks' && this.dom.audiobooksList) {
+      const bookId = this.source?.type === 'audiobook' ? this.source.book?.id : null;
+      const chId = this.source?.type === 'audiobook' ? this.source.chapter?.id : null;
+      let stale = false;
+      this.dom.audiobooksList.querySelectorAll('.audiobook-card').forEach(card => {
+        const active = card.dataset.bookId === bookId;
+        if (card.classList.contains('active-source') !== active) stale = true;
+        const btn = card.querySelector('.playlist-btn-play');
+        const listed = this.audiobooks.find(b => b.id === card.dataset.bookId);
+        const started = !!(listed?.progress?.chapterId && !listed?.progress?.finished);
+        if (btn && btn.textContent !== this._bookPlayLabel(active, started)) stale = true;   // ▶/⏸ follows playback
+      });
+      if (stale) this.renderAudiobooks();
+      else this.dom.audiobooksList.querySelectorAll('.chapter-item').forEach(el => {
+        el.classList.toggle('track-active', el.dataset.chapterId === chId);
+      });
+    }
+    if (this.currentView === 'streaming' && this.dom.streamingSections) {
+      const tid = this.source?.type === 'stream' ? this.source.track?.id : null;
+      let stale = false;
+      this.dom.streamingSections.querySelectorAll('.stream-track-item').forEach(el => {
+        const active = el.dataset.trackId === tid;
+        if (el.classList.contains('track-active') !== active) stale = true;
+        const btn = el.querySelector('.stream-play-btn');
+        if (btn && btn.classList.contains('is-pause') !== (active && this.isPlaying)) stale = true;
+      });
+      if (stale) this.renderStreaming();
+    }
+  }
+
+  async deleteStation(stationId) {
+    try {
+      const res = await fetch(`/api/radio/${stationId}`, { method: 'DELETE' });
+      if (res.ok) {
+        if (this.source?.type === 'radio' && this.source.station?.id === stationId) {
+          this.source.origin = 'directory';   // still playing, just not saved any more
+          this._sendPlaybackState();
+        }
+        await this.loadStations();
+        this.renderStations();
+      }
+    } catch (e) {
+      console.error('[App] Delete station error:', e);
+    }
+  }
+
+  async saveStation(station, { silent = false } = {}) {
+    try {
+      const res = await fetch('/api/radio', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(station),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        if (!silent) this.showAlert('Could not add the station', err.error || 'Please check the stream URL and try again.');
+        return null;
+      }
+      const saved = await res.json();
+      if (this.source?.type === 'radio' && this.source.station?.id === saved.id) {
+        this.source.origin = 'saved';
+        this._sendPlaybackState();
+      }
+      await this.loadStations();
+      if (!silent) this.showPlaylistToast(res.status === 201 ? '📻 Station added' : '📻 Station updated', saved.name, null);
+      return saved;
+    } catch (e) {
+      console.error('[App] Save station error:', e);
+      return null;
+    }
+  }
+
+  openAddStationModal() {
+    if (!this.dom.addStationModal) return;
+    if (this.dom.stationSearchResults) this.dom.stationSearchResults.innerHTML = '<div class="directory-hint">Search by name or genre, tap a genre, or browse the top stations worldwide (public radio-browser.info directory).</div>';
+    if (this.dom.stationSearchInput) this.dom.stationSearchInput.value = '';
+    this._renderStationChips();
+    this.dom.addStationModal.style.display = 'flex';
+    this.dom.stationSearchInput?.focus();
+  }
+
+  _renderStationChips() {
+    const wrap = this.dom.stationBrowseChips;
+    if (!wrap) return;
+    const frag = document.createDocumentFragment();
+    const mk = (label, onClick, cls = '') => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'chip' + (cls ? ' ' + cls : '');
+      b.textContent = label;
+      b.addEventListener('click', onClick);
+      return b;
+    };
+    frag.appendChild(mk('🔥 Top stations', () => this.browseStationDirectory('popular'), 'chip-accent'));
+    this.stationGenres.forEach(g => frag.appendChild(mk(g.label, () => this.browseStationDirectory('tag', g.tag))));
+    wrap.replaceChildren(frag);
+  }
+
+  async browseStationDirectory(kind, value = '') {
+    const out = this.dom.stationSearchResults;
+    if (!out) return;
+    out.innerHTML = '<div class="directory-hint">Loading…</div>';
+    try {
+      const res = await fetch(`/api/radio/browse?kind=${encodeURIComponent(kind)}&value=${encodeURIComponent(value)}`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        out.innerHTML = `<div class="directory-hint">${escapeHtml(data.error || 'Directory unavailable')}</div>`;
+        return;
+      }
+      if (Array.isArray(data.genres) && data.genres.length && this.stationGenres === STATION_GENRES_FALLBACK) {
+        this.stationGenres = data.genres;
+        this._renderStationChips();
+      }
+      this._renderStationResults(data.results || [], kind === 'popular'
+        ? 'No stations returned — try a genre or a search.'
+        : `No ${escapeHtml(value)} stations found — try a search.`);
+    } catch (e) {
+      console.error('[App] Station browse error:', e);
+      out.innerHTML = '<div class="directory-hint">Browse failed — are you online?</div>';
+    }
+  }
+
+  closeAddStationModal() {
+    if (this.dom.addStationModal) this.dom.addStationModal.style.display = 'none';
+  }
+
+  async searchStationDirectory() {
+    const q = this.dom.stationSearchInput?.value.trim() || '';
+    const country = this.dom.stationCountryInput?.value.trim() || '';
+    const place = this.dom.stationPlaceInput?.value.trim() || '';
+    const out = this.dom.stationSearchResults;
+    if ((!q && !place) || !out) return;
+    out.innerHTML = '<div class="directory-hint">Searching…</div>';
+    try {
+      const res = await fetch(`/api/radio/search?q=${encodeURIComponent(q)}&country=${encodeURIComponent(country)}&place=${encodeURIComponent(place)}`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        out.innerHTML = `<div class="directory-hint">${escapeHtml(data.error || 'Directory unavailable')}</div>`;
+        return;
+      }
+      this._renderStationResults(data.results || [], 'No stations found. Try a shorter name, the frequency (“101.3”), the call sign, or add the country — and if the station isn\'t listed, add it below by stream URL.');
+    } catch (e) {
+      console.error('[App] Station search error:', e);
+      out.innerHTML = '<div class="directory-hint">Search failed — are you online?</div>';
+    }
+  }
+
+  /** Directory rows shared by search and browse: ▶ tune in (unsaved) / + Save. */
+  _renderStationResults(results, emptyText) {
+    const out = this.dom.stationSearchResults;
+    if (!out) return;
+    if (results.length === 0) {
+      out.innerHTML = `<div class="directory-hint">${emptyText}</div>`;
+      return;
+    }
+    {
+      const savedIds = new Set(this.stations.map(s => s.id));
+      const frag = document.createDocumentFragment();
+      results.forEach(st => {
+        const row = document.createElement('div');
+        row.className = 'modal-pl-item directory-row';
+        const meta = [st.genre, st.country, st.description, st.nowPlaying ? `♪ ${st.nowPlaying}` : ''].filter(Boolean).join(' • ');
+        row.innerHTML = `
+          <div class="directory-row-main">
+            <span class="modal-pl-item-title" title="${escapeHtml(st.name)}">${escapeHtml(st.name)}${st.online === false ? ' <span class="badge-unverified" title="The directory could not reach this stream recently (often geo-blocking); it may still play here">unverified</span>' : ''}${st.provider === 'tunein' ? ' <span class="badge-provider" title="Found in the TuneIn directory">TuneIn</span>' : ''}</span>
+            <span class="directory-row-meta" title="${escapeHtml(meta)}">${escapeHtml(meta)}</span>
+          </div>
+          <div class="directory-row-actions">
+            <button class="playlist-btn-play directory-play-btn" title="Tune in (saves the station)">▶</button>
+            <button class="playlist-action-btn directory-save-btn" ${savedIds.has(st.id) ? 'disabled' : ''}>${savedIds.has(st.id) ? 'Saved' : '+ Save'}</button>
+          </div>`;
+        row.querySelector('.directory-play-btn').addEventListener('click', async (e) => {
+          e.stopPropagation();
+          await this.playStation(st, { origin: 'directory' });
+          const saveBtn = row.querySelector('.directory-save-btn');
+          if (saveBtn && this.stations.some(x => x.id === st.id)) { saveBtn.textContent = 'Saved'; saveBtn.disabled = true; }
+        });
+        row.querySelector('.directory-save-btn').addEventListener('click', async (e) => {
+          e.stopPropagation();
+          const saved = await this.saveStation(st);
+          if (saved) { e.target.textContent = 'Saved'; e.target.disabled = true; }
+        });
+        frag.appendChild(row);
+      });
+      out.replaceChildren(frag);
+    }
+  }
+
+  async submitManualStation() {
+    const name = this.dom.stationNameInput?.value.trim();
+    const streamUrl = this.dom.stationUrlInput?.value.trim();
+    const genre = this.dom.stationGenreInput?.value.trim();
+    if (!streamUrl || !/^https?:\/\//i.test(streamUrl)) {
+      this.showAlert('Stream URL needed', 'Please enter the station\'s http(s) stream URL.');
+      return;
+    }
+    const saved = await this.saveStation({ name: name || streamUrl, streamUrl, genre: genre || '' });
+    if (saved) {
+      if (this.dom.stationNameInput) this.dom.stationNameInput.value = '';
+      if (this.dom.stationUrlInput) this.dom.stationUrlInput.value = '';
+      if (this.dom.stationGenreInput) this.dom.stationGenreInput.value = '';
+      this.closeAddStationModal();
+      this.switchView('radio');
+    }
+  }
+
+  /** `radioStationsChanged` command: AI DJ saved/renamed/removed a station by voice. */
+  async handleRadioStationsChanged(msg) {
+    const { change, stationId, station, message } = msg;
+    if (this.source?.type === 'radio' && stationId && this.source.station?.id === stationId) {
+      if (change === 'deleted') this.source.origin = 'directory';
+      else {
+        this.source.origin = 'saved';
+        if (station?.name) this.source.station = { ...this.source.station, ...station };
+      }
+      this._updateUI();
+      this._sendPlaybackState();
+    }
+    await this.loadStations();
+    if (this.currentView === 'radio') this.renderStations();
+    if (message) {
+      const titles = { created: '📻 Station saved', updated: '📻 Station updated', deleted: '🗑 Station removed' };
+      this.showPlaylistToast(titles[change] || '📻 Stations updated', message, null);
+    }
+  }
+
+  // --- Podcasts ---
+
+  async loadPodcasts() {
+    try {
+      const res = await fetch('/api/podcasts');
+      if (res.ok) {
+        this.podcasts = await res.json();
+        this._updatePlaylistBadges();
+        this._updateStarterNotes();
+        if (this.currentView === 'podcasts') this.renderPodcasts();
+        this.loadLatestEpisodes();
+        // Starter picks load their episodes in the background on the server;
+        // re-poll a couple of times so the tab fills in without a reload.
+        if (this.podcasts.some(p => p.needsRefresh) && !this.podcastRepollTimer) {
+          let attempts = 0;
+          this.podcastRepollTimer = setInterval(async () => {
+            attempts++;
+            const r = await fetch('/api/podcasts').catch(() => null);
+            if (r?.ok) {
+              this.podcasts = await r.json();
+              this._updatePlaylistBadges();
+              if (this.currentView === 'podcasts') this.renderPodcasts();
+            }
+            if (attempts >= 4 || !this.podcasts.some(p => p.needsRefresh)) {
+              clearInterval(this.podcastRepollTimer);
+              this.podcastRepollTimer = null;
+            }
+          }, 5000);
+        }
+      }
+    } catch (e) {
+      console.error('[App] Failed to load podcasts:', e);
+    }
+  }
+
+  async playEpisode(podcast, episode) {
+    if (!podcast?.id || !episode?.id) return;
+    const startAt = resumePositionFor(this.podcastPositions, episode.id, episode.duration);
+    const url = `/api/podcasts/${podcast.id}/episodes/${episode.id}/stream`;
+    const source = { type: 'podcast', podcast, episode };
+
+    if (startAt > 0) {
+      const player = this.dom.musicPlayer;
+      const onMeta = () => {
+        if (this.source === source) player.currentTime = startAt;
+      };
+      player.addEventListener('loadedmetadata', onMeta, { once: true });
+    }
+    await this._beginSourcePlayback(source, url, { art: podcast.artworkUrl || '', icon: '🎙' });
+    this._sendPlaybackState();
+    if (this.currentView === 'podcasts') this._refreshSourceHighlights();
+    this.showPlaylistToast(`🎙 ${podcast.title}`, `${episode.title}${startAt ? ` • resuming at ${formatClock(startAt)}` : ''}`, null);
+  }
+
+  /** Persist how far into the current episode we are (throttled unless forced). */
+  _rememberEpisodePosition(force = false) {
+    if (this.source?.type !== 'podcast') return;
+    const now = Date.now();
+    if (!force && now - this.lastPositionSaveMs < 5000) return;
+    this.lastPositionSaveMs = now;
+    const player = this.dom.musicPlayer;
+    const ep = this.source.episode;
+    const duration = isFinite(player.duration) && player.duration > 0 ? player.duration : (ep.duration || Infinity);
+    this.podcastPositions = rememberPosition(this.podcastPositions, ep.id, player.currentTime, duration);
+    savePositions(window.localStorage, this.podcastPositions);
+  }
+
+  renderPodcasts() {
+    const list = this.dom.podcastsList;
+    if (!list) return;
+    const visible = filterPodcasts(this.podcasts, this.podcastFilterQuery);
+    if (visible.length === 0) {
+      list.innerHTML = `<div class="sources-empty">${this.podcastFilterQuery
+        ? 'No podcasts matching search'
+        : 'No podcast subscriptions yet. Click Find Podcasts…, or ask AI DJ: “subscribe to …”.'}</div>`;
+      return;
+    }
+    const playingPodId = this.source?.type === 'podcast' ? this.source.podcast?.id : null;
+    const frag = document.createDocumentFragment();
+    visible.forEach(pod => {
+      const isOpen = this.expandedPodcast?.id === pod.id;
+      const card = document.createElement('div');
+      card.className = 'playlist-card source-card podcast-card' + (pod.id === playingPodId ? ' active-source' : '') + (isOpen ? ' expanded' : '');
+      card.dataset.podcastId = pod.id;
+      const latest = pod.latestEpisode ? `Latest: ${formatEpisodeDate(pod.latestEpisode.publishedAt) || pod.latestEpisode.title}` : '';
+      const count = pod.needsRefresh ? 'Episodes load on first open' : `${pod.episodeCount} episode${pod.episodeCount === 1 ? '' : 's'}`;
+      const meta = [pod.author, count, latest].filter(Boolean).join(' • ');
+      card.innerHTML = `
+        <div class="playlist-card-header">
+          <div class="playlist-cover source-cover">🎙</div>
+          <div class="playlist-info">
+            <div class="playlist-name-row">
+              <span class="playlist-name" title="${escapeHtml(pod.title)}">${escapeHtml(pod.title)}</span>
+              ${pod.source === 'default' ? this._starterBadgeHtml() : ''}
+              ${pod.id === playingPodId ? this._nowPlayingPillHtml() : ''}
+            </div>
+            <div class="playlist-meta" title="${escapeHtml(meta)}">${escapeHtml(meta)}</div>
+          </div>
+          <div class="playlist-actions">
+            <button class="playlist-btn-play" title="Play the latest episode">▶ Latest</button>
+            <button class="playlist-btn-cue podcast-cue-btn" title="Cue the latest episode">+ Cue</button>
+            <button class="playlist-btn-subtle podcast-refresh-btn" title="Refresh feed">↻</button>
+            <button class="playlist-btn-subtle danger" title="Unsubscribe">✕</button>
+            <button class="view-toggle-btn" type="button"></button>
+          </div>
+        </div>
+        <div class="playlist-expanded${isOpen && this._openedPodcastWithoutAnimation === pod.id ? ' open' : ''}">
+          <div class="playlist-expanded-inner">
+            <div class="playlist-expanded-actions">
+              <span class="playlist-expanded-sub"></span>
+            </div>
+            <div class="track-list podcast-episodes"></div>
+          </div>
+        </div>`;
+      if (isOpen && this._openedPodcastWithoutAnimation !== pod.id) {
+        const body = card.querySelector('.playlist-expanded');
+        requestAnimationFrame(() => this._expandBody(body));
+        this._openedPodcastWithoutAnimation = pod.id;
+      }
+      this._applyCover(card.querySelector('.source-cover'), pod.artworkUrl, '🎙');
+      this._setViewToggle(card.querySelector('.view-toggle-btn'), isOpen, 'episodes');
+
+      card.querySelector('.playlist-btn-play').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        await this.playLatestEpisode(pod.id);
+      });
+      card.querySelector('.podcast-cue-btn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        await this.cueLatestEpisode(pod.id);
+      });
+      card.querySelector('.view-toggle-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.togglePodcastExpanded(pod.id);
+      });
+      card.querySelector('.podcast-refresh-btn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        await this.refreshPodcast(pod.id);
+      });
+      card.querySelector('.playlist-btn-subtle.danger').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const ok = await this.showConfirm({ title: 'Unsubscribe?', message: `"${pod.title}" will be removed from your podcasts. Resume positions are kept if you re-subscribe.`, confirmText: 'Unsubscribe', danger: true });
+        if (ok) await this.unsubscribePodcast(pod.id);
+      });
+      card.querySelector('.playlist-expanded').addEventListener('click', (e) => e.stopPropagation());
+      card.addEventListener('click', () => this.togglePodcastExpanded(pod.id));
+
+      if (isOpen) this._renderEpisodes(card, this.expandedPodcast);
+      frag.appendChild(card);
+    });
+    list.replaceChildren(frag);
+  }
+
+  _renderEpisodes(card, pod) {
+    const container = card.querySelector('.podcast-episodes');
+    const sub = card.querySelector('.playlist-expanded-sub');
+    if (!container) return;
+    const episodes = pod.episodes || [];
+    if (sub) this._setClampedText(sub, pod.refreshError ? `⚠️ ${pod.refreshError}` : (pod.description || `${episodes.length} episodes`), 3);
+    if (episodes.length === 0) {
+      container.innerHTML = '<div class="sources-empty">This feed has no playable episodes.</div>';
+      return;
+    }
+    const playingEpId = this.source?.type === 'podcast' ? this.source.episode?.id : null;
+    const frag = document.createDocumentFragment();
+    episodes.forEach(ep => {
+      const el = document.createElement('div');
+      const resumeAt = resumePositionFor(this.podcastPositions, ep.id, ep.duration);
+      const progress = episodeProgress(this.podcastPositions, ep);
+      const meta = [formatEpisodeDate(ep.publishedAt), formatDuration(ep.duration), resumeAt ? `Resume at ${formatClock(resumeAt)}` : ''].filter(Boolean).join(' • ');
+      el.className = 'track-item episode-item' + (ep.id === playingEpId ? ' track-active' : '');
+      el.dataset.episodeId = ep.id;
+      const notes = (ep.description || '').replace(/\s+/g, ' ').trim();
+      el.innerHTML = `
+        <div class="track-info episode-info">
+          <div class="track-title" title="${escapeHtml(ep.title)}">${escapeHtml(ep.title)}</div>
+          <div class="track-artist episode-meta">${escapeHtml(meta)}</div>
+          ${notes ? '<div class="episode-excerpt clampable"></div>' : ''}
+          ${progress ? `<div class="episode-progress"><i style="width:${Math.round(progress * 100)}%"></i></div>` : ''}
+        </div>
+        <button class="track-play-btn episode-play-btn" title="${resumeAt ? 'Resume' : 'Play'} this episode">▶ ${resumeAt ? 'Resume' : 'Play'}</button>
+        <button class="track-cue-btn episode-cue-btn" title="Cue this episode">+ Cue</button>
+      `;
+      const excerptEl = el.querySelector('.episode-excerpt');
+      if (excerptEl) this._setClampedText(excerptEl, notes, 2);
+      el.querySelector('.episode-play-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.playEpisode(pod, ep);
+      });
+      el.querySelector('.episode-cue-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.queueEpisode(pod, ep);
+      });
+      el.title = ep.title;
+      frag.appendChild(el);
+    });
+    container.replaceChildren(frag);
+    this._wireSelectableRows(container, '.episode-item', (row) => {
+      const ep = episodes.find(x => x.id === row.dataset.episodeId);
+      if (ep) this.playEpisode(pod, ep);
+    });
+  }
+
+  async togglePodcastExpanded(podcastId, force) {
+    const open = typeof force === 'boolean' ? force : this.expandedPodcast?.id !== podcastId;
+    if (!open) {
+      if (this.expandedPodcast?.id !== podcastId) return;
+      await this._animateCollapse(this.dom.podcastsList?.querySelector(`.podcast-card[data-podcast-id="${podcastId}"]`));
+      this.expandedPodcast = null;
+      this._openedPodcastWithoutAnimation = null;
+      this.renderPodcasts();
+      return;
+    }
+    if (this.expandedPodcast && this.expandedPodcast.id !== podcastId) {
+      await this._animateCollapse(this.dom.podcastsList?.querySelector(`.podcast-card[data-podcast-id="${this.expandedPodcast.id}"]`));
+    }
+    this._openedPodcastWithoutAnimation = null;
+    try {
+      const pod = await this._fetchPodcastLoaded(podcastId);
+      if (!pod) return;
+      this.expandedPodcast = pod;
+      this.renderPodcasts();
+      this.dom.podcastsList?.querySelector(`.podcast-card[data-podcast-id="${podcastId}"]`)
+        ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    } catch (e) {
+      console.error('[App] Failed to expand podcast:', e);
+    }
+  }
+
+  /**
+   * Full podcast (with episodes). A starter pick that has never been fetched
+   * is refreshed first, so "open" or "play latest" just works.
+   */
+  async _fetchPodcastLoaded(podcastId) {
+    const res = await fetch(`/api/podcasts/${podcastId}`);
+    if (!res.ok) return null;
+    let pod = await res.json();
+    if (!pod.lastFetchedAt) {
+      const r = await fetch(`/api/podcasts/${podcastId}/refresh`, { method: 'POST' });
+      if (r.ok) {
+        pod = await r.json();
+        this.loadPodcasts();          // listing now has counts / latest episode
+      }
+    }
+    return pod;
+  }
+
+  async playLatestEpisode(podcastId) {
+    try {
+      const pod = await this._fetchPodcastLoaded(podcastId);
+      if (!pod) return;
+      const ep = (pod.episodes || [])[0];
+      if (!ep) {
+        this.showPlaylistToast('🎙 No episodes', pod.refreshError ? `${pod.title}: ${pod.refreshError}` : `${pod.title} has no playable episodes yet`, null);
+        return;
+      }
+      await this.playEpisode(pod, ep);
+    } catch (e) {
+      console.error('[App] Play latest episode error:', e);
+    }
+  }
+
+  async refreshPodcast(podcastId) {
+    try {
+      const res = await fetch(`/api/podcasts/${podcastId}/refresh`, { method: 'POST' });
+      if (!res.ok) return;
+      const pod = await res.json();
+      if (this.expandedPodcast?.id === podcastId) this.expandedPodcast = pod;
+      await this.loadPodcasts();
+      this.renderPodcasts();
+      this.showPlaylistToast(pod.refreshError ? '⚠️ Refresh failed' : '↻ Feed refreshed',
+        pod.refreshError || `${pod.title}: ${pod.episodeCount} episodes`, null);
+    } catch (e) {
+      console.error('[App] Refresh podcast error:', e);
+    }
+  }
+
+  async unsubscribePodcast(podcastId) {
+    try {
+      const res = await fetch(`/api/podcasts/${podcastId}`, { method: 'DELETE' });
+      if (res.ok) {
+        if (this.expandedPodcast?.id === podcastId) this.expandedPodcast = null;
+        await this.loadPodcasts();
+        this.renderPodcasts();
+      }
+    } catch (e) {
+      console.error('[App] Unsubscribe error:', e);
+    }
+  }
+
+  async subscribeToFeed(feedUrl) {
+    try {
+      const res = await fetch('/api/podcasts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ feedUrl }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        this.showAlert('Could not subscribe', data.error || 'That feed could not be loaded.');
+        return null;
+      }
+      await this.loadPodcasts();
+      this.showPlaylistToast(res.status === 201 ? '🎙 Subscribed' : '🎙 Subscription refreshed', `${data.title} • ${data.episodeCount} episodes`, null);
+      return data;
+    } catch (e) {
+      console.error('[App] Subscribe error:', e);
+      return null;
+    }
+  }
+
+  openAddPodcastModal() {
+    if (!this.dom.addPodcastModal) return;
+    if (this.dom.podcastSearchResults) this.dom.podcastSearchResults.innerHTML = '<div class="directory-hint">Search by name, tap a category, or paste an RSS feed URL below (public Apple podcast directory).</div>';
+    if (this.dom.podcastSearchInput) this.dom.podcastSearchInput.value = '';
+    if (this.dom.podcastFeedInput) this.dom.podcastFeedInput.value = '';
+    if (this.dom.podcastBrowseChips && !this.dom.podcastBrowseChips.childElementCount) {
+      const frag = document.createDocumentFragment();
+      PODCAST_CATEGORIES.forEach(cat => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'chip';
+        b.textContent = cat;
+        b.addEventListener('click', () => {
+          if (this.dom.podcastSearchInput) this.dom.podcastSearchInput.value = cat;
+          this.searchPodcastDirectory();
+        });
+        frag.appendChild(b);
+      });
+      this.dom.podcastBrowseChips.replaceChildren(frag);
+    }
+    this.dom.addPodcastModal.style.display = 'flex';
+    this.dom.podcastSearchInput?.focus();
+  }
+
+  closeAddPodcastModal() {
+    if (this.dom.addPodcastModal) this.dom.addPodcastModal.style.display = 'none';
+  }
+
+  async searchPodcastDirectory() {
+    const q = this.dom.podcastSearchInput?.value.trim();
+    const out = this.dom.podcastSearchResults;
+    if (!q || !out) return;
+    out.innerHTML = '<div class="directory-hint">Searching…</div>';
+    try {
+      const res = await fetch(`/api/podcasts/search?q=${encodeURIComponent(q)}`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        out.innerHTML = `<div class="directory-hint">${escapeHtml(data.error || 'Directory unavailable')}</div>`;
+        return;
+      }
+      const results = data.results || [];
+      if (results.length === 0) {
+        out.innerHTML = '<div class="directory-hint">No podcasts found.</div>';
+        return;
+      }
+      const subscribed = new Set(this.podcasts.map(p => p.id));
+      const frag = document.createDocumentFragment();
+      results.forEach(r => {
+        const row = document.createElement('div');
+        row.className = 'modal-pl-item directory-row';
+        const meta = [r.author, r.genre, r.episodeCount ? `${r.episodeCount} episodes` : ''].filter(Boolean).join(' • ');
+        row.innerHTML = `
+          <div class="directory-row-main">
+            <span class="modal-pl-item-title" title="${escapeHtml(r.title)}">${escapeHtml(r.title)}</span>
+            <span class="directory-row-meta" title="${escapeHtml(meta)}">${escapeHtml(meta)}</span>
+          </div>
+          <div class="directory-row-actions">
+            <button class="playlist-action-btn directory-save-btn" ${subscribed.has(r.id) ? 'disabled' : ''}>${subscribed.has(r.id) ? 'Subscribed' : '+ Subscribe'}</button>
+          </div>`;
+        row.querySelector('.directory-save-btn').addEventListener('click', async (e) => {
+          e.stopPropagation();
+          e.target.disabled = true;
+          e.target.textContent = 'Loading…';
+          const pod = await this.subscribeToFeed(r.feedUrl);
+          if (pod) {
+            e.target.textContent = 'Subscribed';
+            this.closeAddPodcastModal();
+            this.switchView('podcasts');
+            this.togglePodcastExpanded(pod.id, true);
+          } else {
+            e.target.disabled = false;
+            e.target.textContent = '+ Subscribe';
+          }
+        });
+        frag.appendChild(row);
+      });
+      out.replaceChildren(frag);
+    } catch (e) {
+      console.error('[App] Podcast search error:', e);
+      out.innerHTML = '<div class="directory-hint">Search failed — are you online?</div>';
+    }
+  }
+
+  async submitFeedSubscription() {
+    const feedUrl = this.dom.podcastFeedInput?.value.trim();
+    if (!feedUrl || !/^https?:\/\//i.test(feedUrl)) {
+      this.showAlert('Feed URL needed', 'Please paste the podcast\'s http(s) RSS feed URL.');
+      return;
+    }
+    const btn = this.dom.podcastSubscribeBtn;
+    if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
+    const pod = await this.subscribeToFeed(feedUrl);
+    if (btn) { btn.disabled = false; btn.textContent = 'Subscribe'; }
+    if (pod) {
+      this.closeAddPodcastModal();
+      this.switchView('podcasts');
+      this.togglePodcastExpanded(pod.id, true);
+    }
+  }
+
+  /** `podcastsChanged` command: AI DJ subscribed/unsubscribed by voice. */
+  async handlePodcastsChanged(msg) {
+    const { change, podcastId, message } = msg;
+    if (podcastId && this.expandedPodcast?.id === podcastId) {
+      if (change === 'deleted') this.expandedPodcast = null;
+      else {
+        try {
+          const res = await fetch(`/api/podcasts/${podcastId}`);
+          if (res.ok) this.expandedPodcast = await res.json();
+        } catch (e) { /* keep the stale copy */ }
+      }
+    }
+    await this.loadPodcasts();
+    if (this.currentView === 'podcasts') this.renderPodcasts();
+    if (message) {
+      const titles = { created: '🎙 Subscribed', updated: '🎙 Podcast updated', deleted: '🗑 Unsubscribed' };
+      this.showPlaylistToast(titles[change] || '🎙 Podcasts updated', message, null);
+    }
+  }
+
+  // --- Audiobooks (local files from AUDIOBOOKS_DIR) ---
+
+  async loadAudiobooks() {
+    try {
+      const res = await fetch('/api/audiobooks');
+      if (!res.ok) return;
+      const data = await res.json();
+      this.audiobooks = data.books || [];
+      this.audiobooksInfo = { configured: !!data.configured, directoryExists: !!data.directoryExists, scanning: !!data.scanning };
+      this._updatePlaylistBadges();
+      if (this.currentView === 'audiobooks') this.renderAudiobooks();
+      if (data.scanning) setTimeout(() => this.loadAudiobooks(), 1500);   // server still scanning the folder
+    } catch (e) {
+      console.error('[App] Failed to load audiobooks:', e);
+    }
+  }
+
+  async rescanAudiobooks() {
+    if (!this.audiobooksInfo.configured) { this.renderAudiobooks(); return; }
+    try {
+      if (this.dom.audiobooksRescanBtn) this.dom.audiobooksRescanBtn.disabled = true;
+      const res = await fetch('/api/audiobooks/rescan', { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { this.showAlert('Rescan failed', data.error || 'Could not rescan the audiobook folder.'); return; }
+      await this.loadAudiobooks();
+      if (this.expandedAudiobook) {
+        const r = await fetch(`/api/audiobooks/${this.expandedAudiobook.id}`);
+        this.expandedAudiobook = r.ok ? await r.json() : null;
+      }
+      this.renderAudiobooks();
+      this.showPlaylistToast('📖 Audiobooks rescanned', `${data.count} book${data.count === 1 ? '' : 's'} found`, null);
+    } catch (e) {
+      console.error('[App] Rescan audiobooks error:', e);
+    } finally {
+      if (this.dom.audiobooksRescanBtn) this.dom.audiobooksRescanBtn.disabled = false;
+    }
+  }
+
+  renderAudiobooks() {
+    const list = this.dom.audiobooksList;
+    if (!list) return;
+    const info = this.audiobooksInfo;
+    if (this.dom.audiobooksSetupNote) {
+      const show = !info.configured || !info.directoryExists;
+      this.dom.audiobooksSetupNote.style.display = show ? 'flex' : 'none';
+      if (show && this.dom.audiobooksSetupText && info.configured && !info.directoryExists) {
+        this.dom.audiobooksSetupText.innerHTML = '<b>The audiobook folder was not found.</b> Check <code>AUDIOBOOKS_DIR</code> in <code>backend/.env</code>, then click ↻ Rescan.';
+      }
+    }
+    if (this.dom.audiobooksRescanBtn) this.dom.audiobooksRescanBtn.style.display = info.configured ? '' : 'none';
+    const visible = sortAudiobooks(filterAudiobooks(this.audiobooks, this.audiobookFilterQuery));
+    if (visible.length === 0) {
+      list.innerHTML = `<div class="sources-empty">${this.audiobookFilterQuery
+        ? 'No audiobooks matching search'
+        : (info.configured ? (info.scanning ? 'Scanning the audiobook folder…' : 'No audiobooks found. Drop books (folders of chapter files or .m4b files) into your AUDIOBOOKS_DIR and click ↻ Rescan.') : '')}</div>`;
+      return;
+    }
+    const playingBookId = this.source?.type === 'audiobook' ? this.source.book?.id : null;
+    const frag = document.createDocumentFragment();
+    visible.forEach(book => {
+      const isOpen = this.expandedAudiobook?.id === book.id;
+      const card = document.createElement('div');
+      card.className = 'playlist-card source-card audiobook-card' + (book.id === playingBookId ? ' active-source' : '') + (isOpen ? ' expanded' : '');
+      card.dataset.bookId = book.id;
+      const who = [book.author && book.author !== 'Unknown Author' ? book.author : '', book.narrator ? `read by ${book.narrator}` : ''].filter(Boolean).join(' • ');
+      const length = [formatDuration(book.duration), `${book.chapterCount} chapter${book.chapterCount === 1 ? '' : 's'}`].filter(Boolean).join(' • ');
+      const status = bookProgressLabel(book);
+      const pct = Math.round((book.progress?.fraction || 0) * 100);
+      const started = !!(book.progress?.chapterId && !book.progress?.finished);
+      const isActive = book.id === playingBookId;
+      const playLabel = this._bookPlayLabel(isActive, started);
+      card.innerHTML = `
+        <div class="playlist-card-header">
+          <div class="playlist-cover source-cover">📖</div>
+          <div class="playlist-info">
+            <div class="playlist-name-row">
+              <span class="playlist-name" title="${escapeHtml(book.title)}">${escapeHtml(book.title)}</span>
+              ${book.progress?.finished ? '<span class="badge-starter badge-finished" title="You finished this book">Finished</span>' : ''}
+              ${book.id === playingBookId ? this._nowPlayingPillHtml() : ''}
+            </div>
+            <div class="playlist-meta" title="${escapeHtml(who)}">${escapeHtml(who || 'Audiobook')}</div>
+            <div class="playlist-meta book-status" title="${escapeHtml(status)}">${escapeHtml(length)}${status ? ` • ${escapeHtml(status)}` : ''}</div>
+            ${started ? `<div class="episode-progress book-progress"><i style="width:${pct}%"></i></div>` : ''}
+          </div>
+          <div class="playlist-actions">
+            <button class="playlist-btn-play${isActive && this.isPlaying ? ' is-pause' : ''}" title="${isActive ? (this.isPlaying ? 'Pause' : 'Resume') : (started ? 'Continue where you left off' : 'Play from the beginning')}">${playLabel}</button>
+            ${book.progress?.chapterId || book.progress?.finished ? '<button class="playlist-btn-subtle book-reset-btn" title="Forget progress (start over)">↺</button>' : ''}
+            <button class="view-toggle-btn" type="button"></button>
+          </div>
+        </div>
+        <div class="playlist-expanded${isOpen && this._openedBookWithoutAnimation === book.id ? ' open' : ''}">
+          <div class="playlist-expanded-inner">
+            <div class="playlist-expanded-actions">
+              <span class="playlist-expanded-sub"></span>
+            </div>
+            <div class="track-list book-chapters"></div>
+          </div>
+        </div>`;
+      if (isOpen && this._openedBookWithoutAnimation !== book.id) {
+        const body = card.querySelector('.playlist-expanded');
+        requestAnimationFrame(() => this._expandBody(body));
+        this._openedBookWithoutAnimation = book.id;
+      }
+      this._applyCover(card.querySelector('.source-cover'), book.hasCover !== false ? `/api/audiobooks/${book.id}/art` : '', '📖');
+      this._setViewToggle(card.querySelector('.view-toggle-btn'), isOpen, 'chapters');
+
+      card.querySelector('.playlist-btn-play').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (this.source?.type === 'audiobook' && this.source.book?.id === book.id) await this.togglePlayPause();   // pause / resume in place
+        else await this.continueBook(book.id);
+      });
+      card.querySelector('.book-reset-btn')?.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const ok = await this.showConfirm({ title: 'Start over?', message: `Forget your place in "${book.title}"? The book itself stays.`, confirmText: 'Start over' });
+        if (ok) await this.resetBookProgress(book.id);
+      });
+      card.querySelector('.view-toggle-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.toggleAudiobookExpanded(book.id);
+      });
+      card.querySelector('.playlist-expanded').addEventListener('click', (e) => e.stopPropagation());
+      card.addEventListener('click', () => this.toggleAudiobookExpanded(book.id));
+
+      if (isOpen) this._renderChapters(card, this.expandedAudiobook);
+      frag.appendChild(card);
+    });
+    list.replaceChildren(frag);
+  }
+
+  _renderChapters(card, book) {
+    const container = card.querySelector('.book-chapters');
+    const sub = card.querySelector('.playlist-expanded-sub');
+    if (!container) return;
+    const chapters = book.chapters || [];
+    if (sub) sub.textContent = [book.author, book.narrator ? `Narrated by ${book.narrator}` : '', formatDuration(book.duration)].filter(Boolean).join(' • ');
+    if (chapters.length === 0) {
+      container.innerHTML = '<div class="sources-empty">This book has no playable chapters.</div>';
+      return;
+    }
+    const playingChId = this.source?.type === 'audiobook' ? this.source.chapter?.id : null;
+    const resume = resumePointFor(book);
+    const frag = document.createDocumentFragment();
+    chapters.forEach(ch => {
+      const el = document.createElement('div');
+      const isCurrent = ch.id === playingChId;
+      const isResume = resume && resume.chapter.id === ch.id && resume.position > 0;
+      const heard = book.progress && !book.progress.finished && book.progress.chapterIndex ? ch.index < book.progress.chapterIndex : !!book.progress?.finished;
+      const meta = [`Chapter ${ch.index}`, formatDuration(ch.duration), isResume ? `Resume at ${formatClock(resume.position)}` : (heard ? 'Listened' : '')].filter(Boolean).join(' • ');
+      el.className = 'track-item episode-item chapter-item' + (ch.id === playingChId ? ' track-active' : '') + (heard ? ' chapter-heard' : '');
+      el.dataset.chapterId = ch.id;
+      const pct = isResume && ch.duration ? Math.min(100, Math.round(100 * resume.position / ch.duration)) : 0;
+      el.innerHTML = `
+        <div class="track-info episode-info">
+          <div class="track-title" title="${escapeHtml(ch.title)}">${escapeHtml(ch.title)}</div>
+          <div class="track-artist episode-meta">${escapeHtml(meta)}</div>
+          ${pct ? `<div class="episode-progress"><i style="width:${pct}%"></i></div>` : ''}
+        </div>
+        <button class="track-play-btn chapter-play-btn${isCurrent && this.isPlaying ? ' is-pause' : ''}" title="${isCurrent ? (this.isPlaying ? 'Pause' : 'Resume') : (isResume ? 'Resume' : 'Play') + ' this chapter'}">${isCurrent ? (this.isPlaying ? '⏸ Pause' : '▶ Resume') : `▶ ${isResume ? 'Resume' : 'Play'}`}</button>
+      `;
+      el.querySelector('.chapter-play-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (this.source?.type === 'audiobook' && this.source.chapter?.id === ch.id) this.togglePlayPause();
+        else this.playChapter(book, ch, { position: isResume ? resume.position : 0 });
+      });
+      frag.appendChild(el);
+    });
+    container.replaceChildren(frag);
+    this._wireSelectableRows(container, '.chapter-item', (row) => {
+      const ch = chapters.find(x => x.id === row.dataset.chapterId);
+      if (!ch) return;
+      if (this.source?.type === 'audiobook' && this.source.chapter?.id === ch.id) this.togglePlayPause();
+      else this.playChapter(book, ch, { position: resume && resume.chapter.id === ch.id ? resume.position : 0 });
+    });
+  }
+
+  /** Card button text for a book: ⏸ Pause / ▶ Resume while it is the active source, else ▶ Continue / ▶ Play. */
+  _bookPlayLabel(isActive, started) {
+    if (isActive) return this.isPlaying ? '⏸ Pause' : '▶ Resume';
+    return started ? '▶ Continue' : '▶ Play';
+  }
+
+  async toggleAudiobookExpanded(bookId, force) {
+    const open = typeof force === 'boolean' ? force : this.expandedAudiobook?.id !== bookId;
+    if (!open) {
+      if (this.expandedAudiobook?.id !== bookId) return;
+      await this._animateCollapse(this.dom.audiobooksList?.querySelector(`.audiobook-card[data-book-id="${bookId}"]`));
+      this.expandedAudiobook = null;
+      this._openedBookWithoutAnimation = null;
+      this.renderAudiobooks();
+      return;
+    }
+    if (this.expandedAudiobook && this.expandedAudiobook.id !== bookId) {
+      await this._animateCollapse(this.dom.audiobooksList?.querySelector(`.audiobook-card[data-book-id="${this.expandedAudiobook.id}"]`));
+    }
+    this._openedBookWithoutAnimation = null;
+    try {
+      const res = await fetch(`/api/audiobooks/${bookId}`);
+      if (!res.ok) return;
+      this.expandedAudiobook = await res.json();
+      this.renderAudiobooks();
+      this.dom.audiobooksList?.querySelector(`.audiobook-card[data-book-id="${bookId}"]`)
+        ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    } catch (e) {
+      console.error('[App] Failed to expand audiobook:', e);
+    }
+  }
+
+  /** ▶ on a book card: resume where you left off, or start at chapter 1. */
+  async continueBook(bookId) {
+    try {
+      const res = await fetch(`/api/audiobooks/${bookId}`);
+      if (!res.ok) return;
+      const book = await res.json();
+      const point = resumePointFor(book);
+      if (!point) { this.showPlaylistToast('📖 No chapters', `${book.title} has no playable chapters`, null); return; }
+      await this.playChapter(book, point.chapter, { position: point.position });
+    } catch (e) {
+      console.error('[App] Continue book error:', e);
+    }
+  }
+
+  /**
+   * Play one chapter of a book. `book` may be a summary (from the list or a
+   * server command) or the full record with chapters; the full record is
+   * fetched when needed so next/previous chapter work.
+   */
+  async playChapter(book, chapter, { position = 0 } = {}) {
+    if (!book?.id || !chapter?.id) return;
+    if (!Array.isArray(book.chapters) || !book.chapters.length) {
+      try {
+        const res = await fetch(`/api/audiobooks/${book.id}`);
+        if (res.ok) book = await res.json();
+      } catch (e) { /* play with what we have */ }
+    }
+    const url = `/api/audiobooks/${book.id}/chapters/${chapter.id}/stream`;
+    const source = { type: 'audiobook', book, chapter };
+    const startAt = Math.max(0, Number(position) || 0);
+    if (startAt > 0) {
+      const player = this.dom.musicPlayer;
+      const onMeta = () => { if (this.source === source) player.currentTime = startAt; };
+      player.addEventListener('loadedmetadata', onMeta, { once: true });
+    }
+    this.lastBookProgressSaveMs = 0;
+    await this._beginSourcePlayback(source, url, { art: `/api/audiobooks/${book.id}/art`, icon: '📖' });
+    this._saveBookProgress(true, { position: startAt });
+    this._sendPlaybackState();
+    if (this.currentView === 'audiobooks') this.renderAudiobooks();
+    const total = book.chapterCount || (book.chapters || []).length;
+    this.showPlaylistToast(`📖 ${book.title}`, `Chapter ${chapter.index}${total ? ` of ${total}` : ''}${startAt ? ` • resuming at ${formatClock(startAt)}` : ''}`, null);
+  }
+
+  /** Tell the server where we are in the book (throttled unless forced). */
+  _saveBookProgress(force = false, { position = null, finished = false } = {}) {
+    if (this.source?.type !== 'audiobook') return;
+    const now = Date.now();
+    if (!force && now - this.lastBookProgressSaveMs < BOOK_PROGRESS_SAVE_MS) return;
+    this.lastBookProgressSaveMs = now;
+    const { book, chapter } = this.source;
+    const player = this.dom.musicPlayer;
+    const pos = position != null ? position : player.currentTime;
+    const duration = isFinite(player.duration) && player.duration > 0 ? player.duration : (chapter.duration || null);
+    const body = finished
+      ? { chapterId: chapter.id, position: duration || (chapter.duration || 0) + 1, duration: duration || chapter.duration || 1 }
+      : { chapterId: chapter.id, position: pos, duration };
+    fetch(`/api/audiobooks/${book.id}/progress`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), keepalive: true,
+    }).then(async (res) => {
+      if (!res.ok) return;
+      const entry = await res.json().catch(() => null);
+      const listed = this.audiobooks.find(b => b.id === book.id);
+      if (entry && listed) {
+        listed.progress = { ...(listed.progress || {}), ...entry, fraction: listed.progress?.fraction ?? 0 };
+      }
+      if (this.currentView === 'audiobooks' && (finished || force)) this.loadAudiobooks();
+    }).catch(() => { /* offline blip; the next tick retries */ });
+  }
+
+  async resetBookProgress(bookId) {
+    try {
+      const res = await fetch(`/api/audiobooks/${bookId}/progress`, { method: 'DELETE' });
+      if (res.ok) {
+        if (this.expandedAudiobook?.id === bookId) {
+          const r = await fetch(`/api/audiobooks/${bookId}`);
+          if (r.ok) this.expandedAudiobook = await r.json();
+        }
+        await this.loadAudiobooks();
+        this.renderAudiobooks();
+      }
+    } catch (e) {
+      console.error('[App] Reset book progress error:', e);
+    }
+  }
+
+  // --- Streaming (online sources as sub-sections; all audio relayed through the deck) ---
+
+  async loadStreamingStatus() {
+    try {
+      const res = await fetch('/api/streaming/status');
+      if (!res.ok) return;
+      this.streamingStatus = await res.json();
+      this._updatePlaylistBadges();
+      if (this.currentView === 'streaming') this.renderStreaming();
+    } catch (e) {
+      console.error('[App] Failed to load streaming status:', e);
+    }
+  }
+
+  /** Provider list in display order: server status when known, else the static table. */
+  _streamingProviders() {
+    const fromServer = this.streamingStatus?.providers;
+    if (fromServer?.length) return fromServer;
+    return STREAM_PROVIDER_ORDER.map(id => ({ id, ...STREAM_PROVIDERS[id], available: null, description: '' }));
+  }
+
+  renderStreaming() {
+    const out = this.dom.streamingSections;
+    if (!out) return;
+    const frag = document.createDocumentFragment();
+    this._streamingProviders().forEach(p => frag.appendChild(this._streamingSection(p)));
+    out.replaceChildren(frag);
+    this._wireSelectableRows(out, '.stream-track-item', (row) => {
+      const t = this._streamTrackById(row.dataset.trackId);
+      if (t) this.playStreamTrack(t);
+    });
+  }
+
+  _streamTrackById(id) {
+    for (const r of this.streamingResults?.results || []) {
+      const t = (r.tracks || []).find(x => x.id === id);
+      if (t) return t;
+    }
+    return null;
+  }
+
+  /** One provider sub-section: header (name, availability, chevron) + its results. */
+  _streamingSection(p) {
+    const card = document.createElement('div');
+    const collapsed = !!this.streamingCollapsed[p.id];
+    const result = (this.streamingResults?.results || []).find(r => r.provider === p.id);
+    const playingProvider = this.source?.type === 'stream' ? this.source.track?.provider : null;
+    card.className = 'playlist-card source-card streaming-section' + (p.id === playingProvider ? ' active-source' : '') + (collapsed ? '' : ' expanded');
+    card.dataset.provider = p.id;
+    // Section header carries the only "preview" label; whole-song providers get none.
+    const status = p.available === false ? `<span class="badge-starter badge-unavailable" title="${escapeHtml(p.reason || 'Unavailable')}">Not installed</span>`
+      : p.available && !p.full ? '<span class="badge-starter badge-available" title="This source offers 30-second previews">Previews</span>' : '';
+    let summary;
+    if (this.streamingBusy) summary = 'Searching…';
+    else if (result?.error) summary = `⚠️ ${result.error}`;
+    else if (result) summary = `${result.tracks.length} song${result.tracks.length === 1 ? '' : 's'}${result.albums.length ? ` • ${result.albums.length} album${result.albums.length === 1 ? '' : 's'}` : ''} for “${this.streamingQuery}”`;
+    else summary = p.description || '';
+    card.innerHTML = `
+      <div class="playlist-card-header">
+        <div class="playlist-cover source-cover">${p.icon || '🌐'}</div>
+        <div class="playlist-info">
+          <div class="playlist-name-row">
+            <span class="playlist-name">${escapeHtml(p.name)}</span>
+            ${status}
+            ${p.id === playingProvider ? this._nowPlayingPillHtml() : ''}
+          </div>
+          <div class="playlist-meta" title="${escapeHtml(summary)}">${escapeHtml(summary)}</div>
+        </div>
+        <div class="playlist-actions">
+          <button class="view-toggle-btn" type="button"></button>
+        </div>
+      </div>
+      <div class="playlist-expanded${collapsed ? '' : ' open'}">
+        <div class="playlist-expanded-inner streaming-section-body"></div>
+      </div>`;
+    this._setViewToggle(card.querySelector('.view-toggle-btn'), !collapsed, 'results');
+    card.querySelector('.view-toggle-btn').addEventListener('click', (e) => { e.stopPropagation(); this.toggleStreamingSection(p.id); });
+    card.querySelector('.playlist-card-header').addEventListener('click', () => this.toggleStreamingSection(p.id));
+    card.querySelector('.playlist-expanded').addEventListener('click', (e) => e.stopPropagation());
+
+    const body = card.querySelector('.streaming-section-body');
+    if (p.available === false) {
+      body.appendChild(this._streamingHint(`${p.name} needs its third-party tools on the server: ${p.reason || 'not installed'}. Then restart the server.`));
+    } else if (!result) {
+      body.appendChild(this._streamingHint(this.streamingBusy ? 'Searching…' : `Search above to see ${p.name} results here.`));
+    } else if (result.error) {
+      body.appendChild(this._streamingHint(result.error));
+    } else if (!result.tracks.length && !result.albums.length) {
+      body.appendChild(this._streamingHint(`Nothing on ${p.name} for “${this.streamingQuery}”.`));
+    } else {
+      if (result.tracks.length) {
+        const list = document.createElement('div');
+        list.className = 'track-list streaming-tracks';
+        result.tracks.forEach(t => list.appendChild(this._streamTrackRow(t)));
+        body.appendChild(list);
+      }
+      if (result.albums.length) {
+        const albums = document.createElement('div');
+        albums.className = 'streaming-albums';
+        result.albums.forEach(a => albums.appendChild(this._streamAlbumCard(a)));
+        body.appendChild(albums);
+      }
+      if (result.hasMore) {
+        const more = document.createElement('button');
+        more.type = 'button';
+        more.className = 'playlist-action-btn streaming-more-btn';
+        more.textContent = result.loadingMore ? 'Loading…' : 'More results';
+        more.disabled = !!result.loadingMore;
+        more.title = `Fetch the next ${result.limit || 10} ${p.name} songs for this search`;
+        more.addEventListener('click', (e) => { e.stopPropagation(); this.loadMoreStreaming(p.id); });
+        body.appendChild(more);
+      }
+    }
+    return card;
+  }
+
+  /** "More results": append the next page of one provider's songs. */
+  async loadMoreStreaming(pid) {
+    const result = (this.streamingResults?.results || []).find(r => r.provider === pid);
+    if (!result || result.loadingMore || !this.streamingQuery) return;
+    result.loadingMore = true;
+    this.renderStreaming();
+    try {
+      const offset = result.tracks.length;
+      const res = await fetch(`/api/streaming/search?q=${encodeURIComponent(this.streamingQuery)}&providers=${encodeURIComponent(pid)}&offset=${offset}&limit=${result.limit || 10}`);
+      const data = await res.json().catch(() => ({}));
+      const page = (data.results || []).find(r => r.provider === pid);
+      if (!res.ok || !page) {
+        result.hasMore = false;
+        this.showPlaylistToast('⚠️ No more results', data.error || `${providerName(pid)} did not return more songs.`, null);
+      } else {
+        const seen = new Set(result.tracks.map(t => t.id));
+        const fresh = (page.tracks || []).filter(t => !seen.has(t.id));
+        result.tracks.push(...fresh);
+        result.hasMore = !!page.hasMore && fresh.length > 0;
+        if (page.error) { result.error = page.error; result.hasMore = false; }
+      }
+    } catch (e) {
+      console.error('[App] Streaming load more error:', e);
+      result.hasMore = false;
+    } finally {
+      result.loadingMore = false;
+      this.renderStreaming();
+    }
+  }
+
+  toggleStreamingSection(pid) {
+    this.streamingCollapsed = { ...this.streamingCollapsed, [pid]: !this.streamingCollapsed[pid] };
+    this.renderStreaming();
+  }
+
+  _streamingHint(text) {
+    const el = document.createElement('div');
+    el.className = 'sources-empty streaming-hint';
+    el.textContent = text;
+    return el;
+  }
+
+  _streamTrackRow(t) {
+    const el = document.createElement('div');
+    const playing = this.source?.type === 'stream' && this.source.track?.id === t.id;
+    const playable = streamPlayable(t);
+    el.className = 'track-item stream-track-item' + (playing ? ' track-active' : '') + (playable ? '' : ' stream-unplayable');
+    el.dataset.trackId = t.id;
+    if (playable) {
+      el.draggable = true;
+      el.addEventListener('dragstart', (e) => this._startStreamDrag(e, t));
+      el.addEventListener('dragend', () => { this._dragging = null; this._clearDropMarks(); });
+    }
+    // Rows carry no preview/full labels (the section header says it); only an unplayable song is flagged.
+    const badge = playable ? null : { text: 'No clip', title: 'This source offers no preview for this song' };
+    el.innerHTML = `
+      <div class="stream-track-art">${t.albumArt ? `<img src="${escapeHtml(t.albumArt)}" alt="" loading="lazy" />` : '🌐'}</div>
+      <div class="track-info">
+        <div class="track-title" title="${escapeHtml(t.title)}">${escapeHtml(t.title)}${t.explicit ? ' <span class="badge-explicit" title="Explicit">E</span>' : ''}</div>
+        <div class="track-artist">${escapeHtml(t.artist)}${t.album ? ` • ${escapeHtml(t.album)}` : ''}</div>
+      </div>
+      ${badge ? `<span class="badge-mode none" title="${escapeHtml(badge.title)}">${escapeHtml(badge.text)}</span>` : ''}
+      <div class="track-genre">${formatMs(t.durationMs)}</div>
+      <button class="track-play-btn stream-play-btn${playing && this.isPlaying ? ' is-pause' : ''}" title="${playing ? (this.isPlaying ? 'Pause' : 'Resume') : 'Play'}" ${playable ? '' : 'disabled'}>${playing && this.isPlaying ? '⏸' : '▶'}</button>
+      <button class="track-cue-btn stream-cue-btn" title="Cue this track" ${playable ? '' : 'disabled'}>+ Cue</button>
+    `;
+    el.querySelector('.stream-play-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (playing) this.togglePlayPause(); else this.playStreamTrack(t);
+    });
+    el.querySelector('.stream-cue-btn').addEventListener('click', (e) => { e.stopPropagation(); this.queueStreamTrack(t); });
+    return el;
+  }
+
+  /** Album card: ▶ plays its songs (first now, the rest cued); + Cue queues them all. */
+  _streamAlbumCard(item) {
+    const card = document.createElement('div');
+    card.className = 'playlist-card source-card streaming-album';
+    const meta = [item.artist, item.releaseDate ? item.releaseDate.slice(0, 4) : '', item.trackCount ? `${item.trackCount} tracks` : ''].filter(Boolean).join(' • ');
+    card.innerHTML = `
+      <div class="playlist-card-header">
+        <div class="playlist-cover source-cover">💿</div>
+        <div class="playlist-info">
+          <div class="playlist-name-row"><span class="playlist-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</span></div>
+          <div class="playlist-meta" title="${escapeHtml(meta)}">${escapeHtml(meta)}</div>
+        </div>
+        <div class="playlist-actions">
+          <button class="playlist-btn-play" title="Play the album">▶ Play</button>
+          <button class="playlist-btn-cue stream-album-cue-btn" title="Cue all its tracks">+ Cue</button>
+        </div>
+      </div>`;
+    this._applyCover(card.querySelector('.source-cover'), item.image || '', '💿');
+    card.querySelector('.playlist-btn-play').addEventListener('click', (e) => { e.stopPropagation(); this.playStreamAlbum(item); });
+    card.querySelector('.stream-album-cue-btn').addEventListener('click', (e) => { e.stopPropagation(); this.playStreamAlbum(item, { queueOnly: true }); });
+    return card;
+  }
+
+  async searchStreaming() {
+    const q = this.dom.streamingSearchInput?.value.trim() || '';
+    if (!q) return;
+    this.streamingQuery = q;
+    this.streamingBusy = true;
+    this.renderStreaming();
+    try {
+      const res = await fetch(`/api/streaming/search?q=${encodeURIComponent(q)}&limit=10`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        this.streamingResults = { query: q, results: [] };
+        this.showPlaylistToast('⚠️ Search failed', data.error || 'Please try again.', null);
+      } else {
+        this.streamingResults = data;
+      }
+    } catch (e) {
+      console.error('[App] Streaming search error:', e);
+      this.streamingResults = { query: q, results: [] };
+    } finally {
+      this.streamingBusy = false;
+      this.renderStreaming();
+    }
+  }
+
+  async playStreamAlbum(item, { queueOnly = false } = {}) {
+    try {
+      const res = await fetch(`/api/streaming/albums/${item.id}/tracks`);
+      const tracks = (res.ok ? ((await res.json()).tracks || []) : []).filter(streamPlayable);
+      if (!tracks.length) { this.showPlaylistToast('🌐 Nothing to play', `${item.name}: ${providerName(item.provider)} has no playable tracks for it`, null); return; }
+      const context = { type: 'album', name: item.name, id: item.id, provider: item.provider };
+      if (queueOnly) {
+        tracks.forEach(t => this.queueStreamTrack(t, context, { silent: true }));
+        this.showPlaylistToast('➕ Cued from streaming', `${tracks.length} tracks • ${item.name}`, null);
+      } else {
+        await this.playStreamTracks(tracks, context);
+      }
+    } catch (e) {
+      console.error('[App] Streaming album error:', e);
+    }
+  }
+
+  /** First track now, the rest cued (server command and GUI share this). */
+  async playStreamTracks(tracks, context = null) {
+    const playable = (tracks || []).filter(streamPlayable);
+    if (!playable.length) return;
+    const [first, ...rest] = playable;
+    this.queue = this.queue.filter(q => q.kind !== 'stream' || !playable.some(t => t.id === q.id));
+    rest.forEach(t => this.queue.push(streamQueueItem(t, context)));
+    this._updateQueueUI();
+    await this.playStreamTrack(first, { context });
+  }
+
+  queueStreamTrack(track, context = null, { silent = false } = {}) {
+    if (!track?.id || !streamPlayable(track)) return;
+    if (this.queue.some(q => q.id === track.id)) {
+      if (!silent) this.showPlaylistToast('🌐 Already cued', track.title, null);
+      return;
+    }
+    this.queue.push(streamQueueItem(track, context));
+    this._updateQueueUI();
+    this._sendPlaybackState();
+    if (!silent) this.showPlaylistToast('➕ Cued from streaming', `${track.title} • ${track.artist} • ${providerName(track.provider)}`, null);
+  }
+
+  /** Play one streamed track through the deck (the backend relays the audio). */
+  async playStreamTrack(track, { context = null } = {}) {
+    if (!track?.id) return;
+    if (!streamPlayable(track)) {
+      this.showPlaylistToast('⚠️ Can’t play this one', `${track.title}: ${providerName(track.provider)} offers no audio for it`, null);
+      return;
+    }
+    const qIdx = this.queue.findIndex(q => q.id === track.id);
+    if (qIdx !== -1) { this.queue.splice(qIdx, 1); this._updateQueueUI(); }
+    const source = { type: 'stream', track, context };
+    if (track.full) this.showPlaylistToast(`🌐 ${track.title}`, `Fetching from ${providerName(track.provider)}…`, null);
+    await this._beginSourcePlayback(source, `/api/streaming/tracks/${track.id}/audio`, { art: track.albumArt || '', icon: '🌐' });
+    this._sendPlaybackState();
+    if (this.currentView === 'streaming') this.renderStreaming();
+    this.showPlaylistToast(`🌐 ${track.title}`, `${track.artist} • ${providerName(track.provider)}${track.full ? '' : ' • preview'}`, null);
+  }
+
+  /**
+   * A streamed track finished: continue with the queue if there is one,
+   * otherwise stop — never wander into the local library on its own.
+   */
+  _onStreamEnded() {
+    if (this.queue.length > 0) { this.playNextInQueue(); return; }
+    this.isPlaying = false;
+    this.dom.musicPlayer.pause();
+    this._updateUI();
+    this._sendPlaybackState();
+    const t = this.source?.track;
+    this.showPlaylistToast(t?.full ? '🌐 Track ended' : '🌐 Preview ended', `${t?.title || 'Track'} — cue more songs or pick another`, null);
+  }
+
+  // --- Tab carousel ---
+
+  /** Nudge the tab row by roughly one viewport width. */
+  _scrollTabs(direction) {
+    const bar = this.dom.deckTabs;
+    if (!bar) return;
+    bar.scrollBy({ left: direction * Math.max(120, bar.clientWidth * 0.6), behavior: 'smooth' });
+  }
+
+  /** Keep the active tab (and as much of its neighbours as fits) in view. */
+  _revealActiveTab() {
+    const bar = this.dom.deckTabs;
+    const active = bar?.querySelector('.deck-tab.active');
+    if (!bar || !active || bar.scrollWidth <= bar.clientWidth + 1) return;
+    const target = active.offsetLeft - (bar.clientWidth - active.offsetWidth) / 2;
+    bar.scrollTo({ left: Math.max(0, Math.min(target, bar.scrollWidth - bar.clientWidth)), behavior: 'smooth' });
+  }
+
+  /** Show the ‹ › buttons only when there is something to scroll to. */
+  _updateTabArrows() {
+    const bar = this.dom.deckTabs;
+    if (!bar) return;
+    const overflow = bar.scrollWidth > bar.clientWidth + 1;
+    const atStart = bar.scrollLeft <= 1;
+    const atEnd = bar.scrollLeft + bar.clientWidth >= bar.scrollWidth - 1;
+    if (this.dom.tabsPrevBtn) { this.dom.tabsPrevBtn.style.display = overflow ? '' : 'none'; this.dom.tabsPrevBtn.disabled = atStart; }
+    if (this.dom.tabsNextBtn) { this.dom.tabsNextBtn.style.display = overflow ? '' : 'none'; this.dom.tabsNextBtn.disabled = atEnd; }
+    bar.classList.toggle('fade-start', overflow && !atStart);
+    bar.classList.toggle('fade-end', overflow && !atEnd);
+  }
+
+  // --- Newest podcast episodes (workflow: list / play / cue what's new) ---
+
+  async loadLatestEpisodes() {
+    try {
+      const res = await fetch('/api/podcasts/latest?limit=20');
+      if (!res.ok) return;
+      this.latestEpisodes = (await res.json()).items || [];
+      this.renderLatestEpisodes();
+    } catch (e) {
+      console.error('[App] Failed to load newest episodes:', e);
+    }
+  }
+
+  renderLatestEpisodes() {
+    const items = this.latestEpisodes || [];
+    if (this.dom.latestEpisodesCount) this.dom.latestEpisodesCount.textContent = `${items.length}`;
+    if (this.dom.latestEpisodesMeta) {
+      this.dom.latestEpisodesMeta.textContent = items.length
+        ? `Newest: ${items[0].episode.title} • ${items[0].podcast.title}${items[0].episode.publishedAt ? ` • ${formatEpisodeDate(items[0].episode.publishedAt)}` : ''}`
+        : 'The most recent episode from each show appears here once the feeds have loaded.';
+    }
+    if (this.dom.latestPlayBtn) this.dom.latestPlayBtn.disabled = !items.length;
+    if (this.dom.latestCueBtn) this.dom.latestCueBtn.disabled = !items.length;
+    if (this.dom.latestEpisodes) this.dom.latestEpisodes.style.display = this.podcasts.length ? '' : 'none';
+    const list = this.dom.latestEpisodesList;
+    if (!list || !this.latestOpen) return;
+    const playingEpId = this.source?.type === 'podcast' ? this.source.episode?.id : null;
+    const frag = document.createDocumentFragment();
+    items.forEach(({ podcast, episode }) => {
+      const el = document.createElement('div');
+      const resumeAt = resumePositionFor(this.podcastPositions, episode.id, episode.duration);
+      const meta = [podcast.title, formatEpisodeDate(episode.publishedAt), formatDuration(episode.duration), resumeAt ? `Resume at ${formatClock(resumeAt)}` : ''].filter(Boolean).join(' • ');
+      el.className = 'track-item episode-item latest-item' + (episode.id === playingEpId ? ' track-active' : '');
+      el.dataset.episodeId = episode.id;
+      el.innerHTML = `
+        <div class="track-info episode-info">
+          <div class="track-title" title="${escapeHtml(episode.title)}">${escapeHtml(episode.title)}</div>
+          <div class="track-artist episode-meta">${escapeHtml(meta)}</div>
+        </div>
+        <button class="track-play-btn episode-play-btn" title="${resumeAt ? 'Resume' : 'Play'} this episode">▶ ${resumeAt ? 'Resume' : 'Play'}</button>
+        <button class="track-cue-btn episode-cue-btn" title="Cue this episode">+ Cue</button>
+      `;
+      el.querySelector('.episode-play-btn').addEventListener('click', (e) => { e.stopPropagation(); this.playEpisode(podcast, episode); });
+      el.querySelector('.episode-cue-btn').addEventListener('click', (e) => { e.stopPropagation(); this.queueEpisode(podcast, episode); });
+      frag.appendChild(el);
+    });
+    list.replaceChildren(frag);
+    this._wireSelectableRows(list, '.latest-item', (row) => {
+      const it = items.find(x => x.episode.id === row.dataset.episodeId);
+      if (it) this.playEpisode(it.podcast, it.episode);
+    });
+  }
+
+  toggleLatestEpisodes(force) {
+    this.latestOpen = typeof force === 'boolean' ? force : !this.latestOpen;
+    this.dom.latestEpisodes?.classList.toggle('expanded', this.latestOpen);
+    this._setViewToggle(this.dom.latestViewBtn, this.latestOpen, 'the newest episodes');
+    if (this.latestOpen) {
+      this.renderLatestEpisodes();
+      this._expandBody(this.dom.latestEpisodesBody);
+    } else {
+      this._collapseBody(this.dom.latestEpisodesBody);
+    }
+  }
+
+  /** ▶ Play: newest episode now, the rest cued; + Cue: all cued in order. */
+  async playLatestEpisodes({ queueOnly = false } = {}) {
+    const items = this.latestEpisodes || [];
+    if (!items.length) { this.showPlaylistToast('🎙 Nothing new yet', 'Open or refresh a podcast to load its episodes', null); return; }
+    const [first, ...rest] = items;
+    if (queueOnly) {
+      items.forEach(it => this.queueEpisode(it.podcast, it.episode, { silent: true }));
+      this.showPlaylistToast('➕ Cued newest episodes', `${items.length} episodes from your podcasts`, null);
+      return;
+    }
+    this.queue = this.queue.filter(q => q.kind !== 'podcast' || !items.some(it => it.episode.id === q.id));
+    rest.forEach(it => this.queueEpisode(it.podcast, it.episode, { silent: true }));
+    await this.playEpisode(first.podcast, first.episode);
+  }
+
+  // --- Drag & drop: rows -> cue / playlists, reorder within the cue and playlists ---
+
+  _startTracksDrag(e, tracks, label) {
+    const ids = tracks.map(t => t.id);
+    e.dataTransfer.setData(DND.TRACKS, JSON.stringify({ trackIds: ids, label }));
+    e.dataTransfer.effectAllowed = 'copy';
+    this._dragging = { type: DND.TRACKS, trackIds: ids, label };
+    this._setDragImage(e, ids.length > 1 ? `🎵 ${label}` : `🎵 ${tracks[0].title}`);
+    this._dragBodyState(true);
+  }
+
+  _startStreamDrag(e, track) {
+    e.dataTransfer.setData(DND.STREAM, JSON.stringify({ track }));
+    e.dataTransfer.effectAllowed = 'copy';
+    this._dragging = { type: DND.STREAM, track };
+    this._setDragImage(e, `🌐 ${track.title}`);
+    this._dragBodyState(true);
+  }
+
+  /** Body class while something draggable is in flight (highlights drop zones); cleared on dragend. */
+  _dragBodyState(on) {
+    document.body.classList.toggle('dragging-tracks', on);
+    if (!on) return;
+    const end = () => { document.body.classList.remove('dragging-tracks'); this._dragging = null; this._clearDropMarks(); document.removeEventListener('dragend', end, true); };
+    document.addEventListener('dragend', end, true);
+  }
+
+  /** A small pill follows the pointer instead of the whole row. */
+  _setDragImage(e, text) {
+    if (!e.dataTransfer?.setDragImage) return;
+    const ghost = document.createElement('div');
+    ghost.className = 'drag-ghost';
+    ghost.textContent = text;
+    document.body.appendChild(ghost);
+    e.dataTransfer.setDragImage(ghost, 12, 16);
+    setTimeout(() => ghost.remove(), 0);
+  }
+
+  _dragTypes(e) {
+    return new Set(Array.from(e.dataTransfer?.types || []));
+  }
+
+  /** The Up Next card accepts library tracks, streaming tracks and its own rows (reorder). */
+  _makeQueueDropTarget() {
+    const box = this.dom.queueContainer;
+    if (!box) return;
+    box.addEventListener('dragover', (e) => {
+      const types = this._dragTypes(e);
+      if (!(types.has(DND.TRACKS) || types.has(DND.STREAM) || types.has(DND.QUEUE))) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = types.has(DND.QUEUE) ? 'move' : 'copy';
+      box.classList.add('drag-over');
+      const row = e.target.closest?.('.queue-item');
+      this._clearDropMarks(row);
+      if (row) this._markDropBefore(row, e);
+    });
+    box.addEventListener('dragleave', (e) => {
+      if (!box.contains(e.relatedTarget)) { box.classList.remove('drag-over'); this._clearDropMarks(); }
+    });
+    box.addEventListener('drop', (e) => {
+      const types = this._dragTypes(e);
+      if (!(types.has(DND.TRACKS) || types.has(DND.STREAM) || types.has(DND.QUEUE))) return;
+      e.preventDefault();
+      box.classList.remove('drag-over');
+      const row = e.target.closest?.('.queue-item');
+      const at = row ? parseInt(row.dataset.queueIndex, 10) + (this._dropIsBefore(row, e) ? 0 : 1) : this.queue.length;
+      this._clearDropMarks();
+      if (types.has(DND.QUEUE)) {
+        this.moveQueueItem(parseInt(e.dataTransfer.getData(DND.QUEUE), 10), at);
+        return;
+      }
+      if (types.has(DND.STREAM)) {
+        const { track } = JSON.parse(e.dataTransfer.getData(DND.STREAM) || '{}');
+        if (track && !this.queue.some(q => q.id === track.id)) {
+          this.queue.splice(Math.min(at, this.queue.length), 0, streamQueueItem(track));
+          this._afterQueueChange();
+          this.showPlaylistToast('➕ Cued', `${track.title} • ${providerName(track.provider)}`, null);
+        }
+        return;
+      }
+      const { trackIds = [], label } = JSON.parse(e.dataTransfer.getData(DND.TRACKS) || '{}');
+      const tracks = trackIds.map(id => this.tracks.find(t => t.id === id)).filter(t => t && !this.queue.some(q => q.id === t.id));
+      if (!tracks.length) return;
+      this.queue.splice(Math.min(at, this.queue.length), 0, ...tracks);
+      this._afterQueueChange();
+      this.showPlaylistToast('➕ Cued', tracks.length === 1 ? tracks[0].title : `${tracks.length} tracks • ${label || ''}`, null);
+    });
+  }
+
+  /** Playlist cards accept library tracks (added to the playlist); streamed tracks are refused. */
+  _makePlaylistDropTarget(card, pl) {
+    card.addEventListener('dragover', (e) => {
+      const types = this._dragTypes(e);
+      if (!(types.has(DND.TRACKS) || types.has(DND.STREAM))) return;
+      if (types.has(DND.PLTRACK) && this._dragging?.playlistId === pl.id) return;   // reordering inside this playlist: rows handle it
+      e.preventDefault();
+      e.dataTransfer.dropEffect = types.has(DND.STREAM) ? 'none' : 'copy';
+      card.classList.toggle('drag-over', !types.has(DND.STREAM));
+      card.classList.toggle('drag-refuse', types.has(DND.STREAM));
+    });
+    card.addEventListener('dragleave', (e) => {
+      if (!card.contains(e.relatedTarget)) card.classList.remove('drag-over', 'drag-refuse');
+    });
+    card.addEventListener('drop', async (e) => {
+      const types = this._dragTypes(e);
+      card.classList.remove('drag-over', 'drag-refuse');
+      if (types.has(DND.PLTRACK) && this._dragging?.playlistId === pl.id) return;
+      if (types.has(DND.STREAM)) {
+        e.preventDefault();
+        this.showPlaylistToast('📑 Local songs only', 'Playlists hold tracks from your Music library; streamed songs can be cued instead.', null);
+        return;
+      }
+      if (!types.has(DND.TRACKS)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const { trackIds = [], label } = JSON.parse(e.dataTransfer.getData(DND.TRACKS) || '{}');
+      const fresh = trackIds.filter(id => this.tracks.some(t => t.id === id));
+      if (!fresh.length) return;
+      await this.addTracksToPlaylist(pl.id, fresh, label);
+    });
+  }
+
+  async addTracksToPlaylist(playlistId, trackIds, label = '') {
+    try {
+      const res = await fetch(`/api/playlists/${playlistId}/tracks`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ trackIds }),
+      });
+      if (!res.ok) { this.showAlert('Could not add to playlist', 'The server refused the change.'); return; }
+      const updated = await res.json();
+      await this.loadPlaylists();
+      if (this.expandedPlaylist?.id === playlistId) await this.refreshExpandedPlaylist();
+      this.renderPlaylists();
+      const what = trackIds.length === 1 ? (this.tracks.find(t => t.id === trackIds[0])?.title || 'Track') : `${trackIds.length} tracks${label ? ` (${label})` : ''}`;
+      this.showPlaylistToast('📑 Added to playlist', `${what} → ${updated.name}`, playlistId);
+    } catch (e) {
+      console.error('[App] Add tracks to playlist error:', e);
+    }
+  }
+
+  /** Persist a new order after a row was dropped before/after another row. */
+  async reorderPlaylistTrack(pl, movedId, targetId, before) {
+    const ids = (this.expandedPlaylist?.id === pl.id ? (this.expandedPlaylist.tracks || []).map(t => t.id) : (pl.trackIds || [])).slice();
+    const from = ids.indexOf(movedId);
+    if (from === -1 || movedId === targetId) return;
+    ids.splice(from, 1);
+    let to = ids.indexOf(targetId);
+    if (to === -1) return;
+    if (!before) to += 1;
+    ids.splice(to, 0, movedId);
+    try {
+      const res = await fetch(`/api/playlists/${pl.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ trackIds: ids }) });
+      if (!res.ok) return;
+      if (this.expandedPlaylist?.id === pl.id) await this.refreshExpandedPlaylist();
+      await this.loadPlaylists();
+      this.renderPlaylists();
+    } catch (e) {
+      console.error('[App] Reorder playlist error:', e);
+    }
+  }
+
+  /** Move a cued item so it ends up at position `to` of the list as it was before the move. */
+  moveQueueItem(from, to) {
+    if (!Number.isInteger(from) || from < 0 || from >= this.queue.length) return;
+    const [item] = this.queue.splice(from, 1);
+    let target = Math.max(0, Math.min(to, this.queue.length + 1));
+    if (from < to) target -= 1;
+    this.queue.splice(Math.max(0, Math.min(target, this.queue.length)), 0, item);
+    this._afterQueueChange();
+  }
+
+  _afterQueueChange() {
+    this._updateQueueUI();
+    this._sendPlaybackState();
+  }
+
+  _dropIsBefore(row, e) {
+    const r = row.getBoundingClientRect();
+    return e.clientY < r.top + r.height / 2;
+  }
+
+  _markDropBefore(row, e) {
+    const before = this._dropIsBefore(row, e);
+    row.classList.toggle('drop-before', before);
+    row.classList.toggle('drop-after', !before);
+  }
+
+  _clearDropMarks(except = null) {
+    document.querySelectorAll('.drop-before, .drop-after').forEach(el => {
+      if (el !== except) el.classList.remove('drop-before', 'drop-after');
+    });
+  }
+
+  // --- Tab carousel: drag to scroll ---
+
+  _makeTabsDraggable() {
+    const bar = this.dom.deckTabs;
+    if (!bar) return;
+    let startX = 0, startLeft = 0, moved = false, active = false;
+    bar.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0 || bar.scrollWidth <= bar.clientWidth) return;
+      active = true; moved = false; startX = e.clientX; startLeft = bar.scrollLeft;
+      bar.classList.add('grabbing');
+      bar.style.scrollBehavior = 'auto';           // follow the pointer 1:1 while dragging
+    });
+    bar.addEventListener('pointermove', (e) => {
+      if (!active) return;
+      const dx = e.clientX - startX;
+      if (!moved && Math.abs(dx) > 5) { moved = true; try { bar.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ } }
+      if (moved) bar.scrollLeft = startLeft - dx;
+    });
+    const finish = (e) => {
+      if (!active) return;
+      active = false;
+      bar.classList.remove('grabbing');
+      bar.style.scrollBehavior = '';
+      if (moved) {
+        // Swallow the click that ends a drag so a tab under the pointer doesn't activate.
+        const swallow = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
+        bar.addEventListener('click', swallow, { capture: true, once: true });
+        setTimeout(() => bar.removeEventListener('click', swallow, { capture: true }), 0);
+        this._snapTabs();
+      }
+      try { if (e.pointerId !== undefined && bar.hasPointerCapture?.(e.pointerId)) bar.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+    };
+    bar.addEventListener('pointerup', finish);
+    bar.addEventListener('pointercancel', finish);
+  }
+
+  /** After a drag, settle on a tab boundary. */
+  _snapTabs() {
+    const bar = this.dom.deckTabs;
+    if (!bar) return;
+    const tabs = [...bar.querySelectorAll('.deck-tab')];
+    if (!tabs.length) return;
+    const nearest = tabs.reduce((best, t) => Math.abs(t.offsetLeft - bar.scrollLeft) < Math.abs(best.offsetLeft - bar.scrollLeft) ? t : best, tabs[0]);
+    const target = Math.max(0, Math.min(nearest.offsetLeft - 6, bar.scrollWidth - bar.clientWidth));
+    bar.scrollTo({ left: target, behavior: 'smooth' });
+  }
+
   // --- Modal: Add to Playlist ---
 
   openAddToPlaylistModal(track) {
@@ -2629,27 +5773,46 @@ class AIDJApp {
   }
 
   openCreatePlaylistModal() {
-    const name = prompt('Enter a name for the new playlist:');
-    if (name && name.trim()) {
-      this.createNewPlaylist(name.trim());
-    }
+    if (!this.dom.newPlaylistModal) return;
+    if (this.dom.newPlaylistNameInput) this.dom.newPlaylistNameInput.value = '';
+    if (this.dom.newPlaylistDescInput) this.dom.newPlaylistDescInput.value = '';
+    this.dom.newPlaylistModal.style.display = 'flex';
+    this.dom.newPlaylistNameInput?.focus();
   }
 
-  async createNewPlaylist(name, trackIds = []) {
+  closeCreatePlaylistModal() {
+    if (this.dom.newPlaylistModal) this.dom.newPlaylistModal.style.display = 'none';
+  }
+
+  async submitCreatePlaylist() {
+    const name = this.dom.newPlaylistNameInput?.value.trim();
+    if (!name) {
+      this.dom.newPlaylistNameInput?.focus();
+      return;
+    }
+    const description = this.dom.newPlaylistDescInput?.value.trim() || '';
+    const created = await this.createNewPlaylist(name, [], description);
+    if (created) this.closeCreatePlaylistModal();
+  }
+
+  async createNewPlaylist(name, trackIds = [], description = '') {
     try {
       const res = await fetch('/api/playlists', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, trackIds, description: 'Custom Playlist' })
+        body: JSON.stringify({ name, trackIds, description: description || 'Custom Playlist' })
       });
       if (res.ok) {
         const created = await res.json();
         await this.loadPlaylists();
         this.showPlaylist(created.id);
+        this.showPlaylistToast('📑 Playlist created', created.name, created.id);
+        return created;
       }
     } catch (e) {
       console.error('[App] Create playlist error:', e);
     }
+    return null;
   }
 
   // --- Save Queue as Playlist ---
@@ -2675,10 +5838,10 @@ class AIDJApp {
     if (this.currentTrackIndex >= 0 && this.tracks[this.currentTrackIndex]) {
       allTracks.push(this.tracks[this.currentTrackIndex].id);
     }
-    this.queue.forEach(t => allTracks.push(t.id));
+    this.queue.filter(t => t.kind !== 'podcast').forEach(t => allTracks.push(t.id));   // playlists hold songs only
 
     if (allTracks.length === 0) {
-      alert('The queue is empty. Cue up some songs first!');
+      this.showAlert('Nothing to save', 'The queue has no songs to save. Cue up some songs first!');
       this.closeSaveQueueModal();
       return;
     }
