@@ -25,7 +25,9 @@ try:
 except ImportError:
     from textmatch import best_match, normalize
 
-PODCASTS_FILE = Path(__file__).parent / "podcasts.json"
+import os
+
+PODCASTS_FILE = Path(os.getenv("DATA_DIR", Path(__file__).parent)) / "podcasts.json"
 
 USER_AGENT = "AI-DJ/1.0 (+https://github.com/ai-dj; local prototype)"
 ITUNES_SEARCH_URL = "https://itunes.apple.com/search"

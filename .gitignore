@@ -98,6 +98,17 @@ yarn-error.log*
 .pnpm-debug.log*
 
 # ==========================================
+# Android Build & Signing
+# ==========================================
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
+android/.idea/
+*.jks
+*.keystore
+
+# ==========================================
 # Operating System Files
 # ==========================================
 # Windows

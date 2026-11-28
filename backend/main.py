@@ -140,10 +140,10 @@ ONLINE_DIRECTORIES = os.getenv("ONLINE_DIRECTORIES", "true").lower() == "true"
 # coverage of local commercial stations. Set false to use radio-browser only.
 TUNEIN_DIRECTORY = os.getenv("TUNEIN_DIRECTORY", "true").lower() == "true"
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".wma", ".aac"}
-FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
+FRONTEND_DIR = Path(os.getenv("FRONTEND_DIR", Path(__file__).parent.parent / "frontend"))
 STREAM_CHUNK_SIZE = 64 * 1024
 
-if not GEMINI_API_KEY:
+if not GEMINI_API_KEY and os.getenv("ALLOW_MISSING_API_KEY", "false").lower() != "true":
     raise RuntimeError("GEMINI_API_KEY not set in .env")
 
 # Global State
@@ -3585,7 +3585,13 @@ async def ws_live_proxy(ws: WebSocket):
     await conn.send_json({"type": "ready"})
     print("[ws] Browser connected")
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    api_key = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        await conn.send_json({"type": "error", "message": "GEMINI_API_KEY not configured"})
+        await ws.close(code=1008)
+        return
+
+    client = genai.Client(api_key=api_key)
 
     session = None
     session_stop = None

@@ -31,7 +31,9 @@ except ImportError:
     from textmatch import best_match, normalize
     import scancache
 
-PROGRESS_FILE = Path(__file__).parent / "audiobooks.json"
+import os
+
+PROGRESS_FILE = Path(os.getenv("DATA_DIR", Path(__file__).parent)) / "audiobooks.json"
 
 AUDIOBOOK_EXTENSIONS = {".m4b", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".flac", ".wma", ".wav"}
 COVER_FILENAMES = ("cover.jpg", "cover.jpeg", "cover.png", "folder.jpg", "folder.jpeg", "folder.png", "front.jpg")

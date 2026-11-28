@@ -1,0 +1,9 @@
+anyio==4.16.0
+httpx==0.28.1
+mutagen==1.48.1
+python-dotenv==1.2.4
+starlette==1.10.0
+uvicorn==0.54.0
+websockets==17.4
+yt-dlp==2026.10.26
+ytmusicapi==1.12.4

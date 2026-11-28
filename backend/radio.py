@@ -25,7 +25,9 @@ except ImportError:
 
 __all__ = ["COMMON_FILLER"]  # re-exported for main.py's generic-request check
 
-STATIONS_FILE = Path(__file__).parent / "radio_stations.json"
+import os
+
+STATIONS_FILE = Path(os.getenv("DATA_DIR", Path(__file__).parent)) / "radio_stations.json"
 
 USER_AGENT = "AI-DJ/1.0 (+https://github.com/ai-dj; local prototype)"
 DIRECTORY_BASE = "https://all.api.radio-browser.info/json"

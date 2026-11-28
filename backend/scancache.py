@@ -12,11 +12,12 @@ Cache files live next to the other JSON state (git-ignored):
 """
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
-CACHE_DIR = Path(__file__).parent
+CACHE_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent))
 CACHE_VERSION = 1
 
 

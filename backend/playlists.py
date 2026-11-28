@@ -12,7 +12,9 @@ import hashlib
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 
-PLAYLISTS_FILE = Path(__file__).parent / "playlists.json"
+import os
+
+PLAYLISTS_FILE = Path(os.getenv("DATA_DIR", Path(__file__).parent)) / "playlists.json"
 
 # Curated eras & keywords for intelligent decade/vibe matching
 DECADE_MAPPINGS = {
